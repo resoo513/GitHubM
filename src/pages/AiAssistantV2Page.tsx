@@ -36,7 +36,8 @@ import {
   toSessionMeta,
 } from '@/ai-v2/sessionStore';
 import type { SessionIndex, V2Session } from '@/ai-v2/sessionStore';
-import { appendBlockDelta, appendToolBlock, ensureBlocks } from '@/ai-v2/blocks';
+import { appendBlockDelta, appendToolBlock, buildRenderGroups, ensureBlocks } from '@/ai-v2/blocks';
+import AiExecutionPanel from '@/components/ai/AiExecutionPanel';
 import { deriveSessionTitle } from '@/ai-v2/sessionTitle';
 import { extractPdfText, MAX_PDF_BYTES } from '@/ai-v2/pdf';
 import RepoSelector from '@/components/ai/RepoSelector';
@@ -77,6 +78,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Copy,
   Eye,
   FileText,
@@ -230,32 +232,28 @@ function groupSessions(sessions: V2Session[]): Array<{ label: string; items: V2S
 
 function ReasoningPanel({ text, streaming }: { text: string; streaming?: boolean }) {
   const [open, setOpen] = useState(Boolean(streaming));
-
   useEffect(() => {
     if (!streaming) setOpen(false);
   }, [streaming]);
-
   if (!text) return null;
   return (
-    <div className="mb-2 overflow-hidden rounded-lg border border-border/70 bg-muted/25">
+    <div className="min-w-0">
       <button
         type="button"
         onClick={() => setOpen(prev => !prev)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] text-muted-foreground hover:bg-muted/40"
+        className="inline-flex items-center gap-1 py-0.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
       >
-        <Sparkles className="h-3.5 w-3.5 shrink-0" />
-        <span className="flex-1">{streaming ? i18n.t('思考中…') : i18n.t('已完成思考')}</span>
-        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <span>{streaming ? i18n.t('思考中') : i18n.t('已思考')}</span>
+        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
       </button>
       {open && (
-        <div className="max-h-64 overflow-y-auto border-t border-border/60 px-3 py-2 text-xs leading-5 text-muted-foreground whitespace-pre-wrap">
+        <div className="mt-1.5 whitespace-pre-wrap border-l-2 border-border/70 pl-3 text-[13px] leading-6 text-muted-foreground">
           {text}
         </div>
       )}
     </div>
   );
 }
-
 function ToolCard({ tool, onOpenArtifact }: { tool: UiToolRun; onOpenArtifact: (meta: ArtifactMeta) => void }) {
   const [open, setOpen] = useState(false);
   const duration = tool.startedAt && tool.endedAt
@@ -345,7 +343,7 @@ ${text.slice(-STREAMING_PLAIN_LIMIT)}`
 …` : base;
   return (
     <div className={cn(
-      'min-w-0 text-sm leading-6 break-words',
+      'min-w-0 text-[15px] leading-7 break-words',
       error ? 'text-destructive' : 'text-foreground',
     )}>
       {streaming ? (
@@ -377,7 +375,7 @@ function AssistantTurn({ message, onOpenArtifact, onApplyDiff }: {
   const blocks = message.blocks || [];
   const tools = message.tools || [];
   const isStreaming = Boolean(message.streaming);
-  const lastIndex = blocks.length - 1;
+
   const hasBody = blocks.length > 0 || Boolean(message.content || message.reasoning) || tools.length > 0;
   const copy = async () => {
     try {
@@ -389,26 +387,31 @@ function AssistantTurn({ message, onOpenArtifact, onApplyDiff }: {
   };
 
   // 新消息按区块顺序渲染：思考 → 工具 → 正文 → 工具 → 正文…
-  const renderedBlocks = blocks.map((block, index) => {
-    const isLast = index === lastIndex;
-    if (block.type === 'reasoning') {
-      if (!block.text) return null;
-      return <ReasoningPanel key={block.id} text={block.text} streaming={isStreaming && isLast} />;
+  // 区块合并成展示分组：连续工具调用收进执行面板，正文保持独立
+  const groups = buildRenderGroups(blocks);
+  const lastGroupIndex = groups.length - 1;
+  const renderedBlocks = groups.map((group, index) => {
+    const isLast = index === lastGroupIndex;
+    if (group.kind === 'reasoning') {
+      return <ReasoningPanel key={group.id} text={group.text} streaming={isStreaming && isLast} />;
     }
-    if (block.type === 'tool') {
-      const tool = tools.find(item => item.id === block.toolId);
-      if (!tool) return null;
+    if (group.kind === 'execution') {
+      const groupTools = group.toolIds
+        .map(id => tools.find(item => item.id === id))
+        .filter((tool): tool is UiToolRun => Boolean(tool));
+      if (!groupTools.length) return null;
       return (
-        <div key={block.id} className="my-1.5 border-l-2 border-primary/20 pl-2.5">
-          <ToolCard tool={tool} onOpenArtifact={onOpenArtifact} />
-        </div>
+        <AiExecutionPanel
+          key={group.id}
+          tools={groupTools}
+          onOpenArtifact={onOpenArtifact}
+        />
       );
     }
-    if (!block.text) return null;
     return (
       <AssistantTextBlock
-        key={block.id}
-        text={block.text}
+        key={group.id}
+        text={group.text}
         streaming={isStreaming && isLast}
         error={message.error && isLast}
         onApplyDiff={onApplyDiff}
@@ -418,7 +421,7 @@ function AssistantTurn({ message, onOpenArtifact, onApplyDiff }: {
 
   return (
     <div className="min-w-0">
-      {blocks.length > 0 ? (
+      {groups.length > 0 ? (
         <div className="space-y-2">{renderedBlocks}</div>
       ) : (
         <>
@@ -442,25 +445,26 @@ function AssistantTurn({ message, onOpenArtifact, onApplyDiff }: {
         </div>
       )}
 
-      {message.metrics && !message.streaming && (
-        <div className="mt-1 flex flex-wrap items-center gap-2 text-[9px] text-muted-foreground/70">
-          {message.metrics.totalTokens ? <span>{message.metrics.totalTokens} tokens</span> : null}
-          {message.metrics.firstTokenMs ? <span>首字 {Math.round(message.metrics.firstTokenMs / 100) / 10}s</span> : null}
-          {message.metrics.durationMs ? <span>总耗时 {Math.round(message.metrics.durationMs / 100) / 10}s</span> : null}
-          {message.metrics.model ? <span className="max-w-[180px] truncate font-mono">{message.metrics.model}</span> : null}
-        </div>
-      )}
-
-      {message.content && !message.streaming && (
-        <div className="mt-1.5 flex items-center gap-1">
-          <button
-            type="button"
-            onClick={copy}
-            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <Copy className="h-3 w-3" />
-            {i18n.t('复制')}
-          </button>
+      {!message.streaming && (message.content || message.metrics) && (
+        <div className="mt-2 flex flex-wrap items-center gap-3">
+          {message.content && (
+            <button
+              type="button"
+              onClick={copy}
+              title={i18n.t('复制')}
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <Copy className="h-4 w-4" />
+            </button>
+          )}
+          {message.metrics && (
+            <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/70">
+              {message.metrics.totalTokens ? <span>{message.metrics.totalTokens} tokens</span> : null}
+              {message.metrics.firstTokenMs ? <span>首字 {Math.round(message.metrics.firstTokenMs / 100) / 10}s</span> : null}
+              {message.metrics.durationMs ? <span>总耗时 {Math.round(message.metrics.durationMs / 100) / 10}s</span> : null}
+              {message.metrics.model ? <span className="max-w-[180px] truncate font-mono">{message.metrics.model}</span> : null}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -491,15 +495,13 @@ function buildTurns(messages: UiChatMessage[]): ConversationTurn[] {
   return turns;
 }
 
-function ConversationTurnView({ turn, index, onOpenArtifact, onApplyDiff }: {
+function ConversationTurnView({ turn, onOpenArtifact, onApplyDiff }: {
   turn: ConversationTurn;
   index: number;
   onOpenArtifact: (meta: ArtifactMeta) => void;
   onApplyDiff: (path: string, diff: string) => void;
 }) {
   const [userExpanded, setUserExpanded] = useState(false);
-  const streaming = turn.assistants.some(message => message.streaming);
-  const hasError = turn.assistants.some(message => message.error);
   const userContent = turn.user?.content || '';
   const userIsLong = userContent.length > MAX_USER_MESSAGE_CHARS;
   const shownUserContent = userIsLong && !userExpanded
@@ -507,42 +509,25 @@ function ConversationTurnView({ turn, index, onOpenArtifact, onApplyDiff }: {
     : userContent;
 
   return (
-    <section
-      className={cn(
-        'rounded-xl border p-3 transition-colors sm:p-4',
-        streaming
-          ? 'border-primary/25 bg-card/60 shadow-sm'
-          : 'border-border/80 bg-card/35',
-      )}
-    >
+    <section className="flex min-w-0 flex-col gap-3">
       {turn.user && (
-        <div className="space-y-1.5">
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
-              Prompt
-            </span>
-            <span className="text-[9px] text-muted-foreground/70">
-              {formatTime(turn.user.createdAt)}
-            </span>
-          </div>
-          <div className="flex justify-end">
-            <div className="max-w-[90%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm leading-6 text-primary-foreground break-words">
-              <span className="whitespace-pre-wrap break-words">{shownUserContent}</span>
-              {userIsLong && (
-                <button
-                  type="button"
-                  onClick={() => setUserExpanded(value => !value)}
-                  className="mt-1 block text-[10px] text-primary-foreground/80 underline-offset-2 hover:underline"
-                >
-                  {userExpanded
-                    ? i18n.t('收起内容')
-                    : i18n.t('展开全部（共 {{count}} 字）', { count: userContent.length })}
-                </button>
-              )}
-            </div>
+        <div className="flex min-w-0 flex-col items-end gap-1.5">
+          <div className="max-w-[86%] min-w-0 rounded-2xl rounded-br-md bg-muted px-3.5 py-2.5 text-[15px] leading-7 text-foreground">
+            <span className="whitespace-pre-wrap break-words">{shownUserContent}</span>
+            {userIsLong && (
+              <button
+                type="button"
+                onClick={() => setUserExpanded(value => !value)}
+                className="mt-1 block text-[10px] text-primary underline-offset-2 hover:underline"
+              >
+                {userExpanded
+                  ? i18n.t('收起内容')
+                  : i18n.t('展开全部（共 {{count}} 字）', { count: userContent.length })}
+              </button>
+            )}
           </div>
           {turn.user.attachments && turn.user.attachments.length > 0 && (
-            <div className="flex flex-wrap justify-end gap-1">
+            <div className="flex max-w-[94%] flex-wrap justify-end gap-1">
               {turn.user.attachments.map(attachment => (
                 <span
                   key={attachment.id}
@@ -561,28 +546,18 @@ function ConversationTurnView({ turn, index, onOpenArtifact, onApplyDiff }: {
         </div>
       )}
 
-      <div className={cn(turn.user && 'mt-3 border-t border-border/60 pt-3')}>
-        <div className="mb-1.5 flex items-center gap-1.5">
-          <Sparkles className="h-3.5 w-3.5 text-primary" />
-          <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
-            Response
-          </span>
-          {streaming && (
-            <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
-              {i18n.t('正在生成')}
-            </span>
-          )}
-          {hasError && <Badge variant="destructive" className="px-1.5 py-0 text-[9px]">{i18n.t('失败')}</Badge>}
-          <span className="ml-auto text-[9px] text-muted-foreground/60">#{index + 1}</span>
-        </div>
+      <div className="min-w-0 border-t border-border/60 pt-3">
 
         {turn.assistants.length > 0 ? (
-          <div className="space-y-3">
-            {turn.assistants.map(message => <AssistantTurn key={message.id} message={message} onOpenArtifact={onOpenArtifact} onApplyDiff={onApplyDiff} />)}
+          <div className="min-w-0 space-y-4">
+            {turn.assistants.map(message => (
+              <div key={message.id} className="min-w-0">
+                <AssistantTurn message={message} onOpenArtifact={onOpenArtifact} onApplyDiff={onApplyDiff} />
+              </div>
+            ))}
           </div>
         ) : (
-          <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2 py-1 text-[13px] text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
             {i18n.t('思考中…')}
           </div>
@@ -1673,6 +1648,21 @@ export default function AiAssistantV2Page() {
     }
   }, [flushStreamDelta]);
 
+  /** 运行结束时把仍在执行中的工具标成已停止，避免一直转圈 */
+  const settleRunningTools = useCallback((assistantId: string) => {
+    setMessages(prev => prev.map(message => {
+      if (message.id !== assistantId) return message;
+      const tools = message.tools || [];
+      if (!tools.some(tool => tool.status === 'running')) return message;
+      return {
+        ...message,
+        tools: tools.map(tool => (tool.status === 'running'
+          ? { ...tool, status: 'error' as const, content: tool.content || i18n.t('已停止'), endedAt: tool.endedAt || Date.now() }
+          : tool)),
+      };
+    }));
+  }, [setMessages]);
+
   const patchTool = useCallback((assistantId: string, callId: string, patch: Partial<UiToolRun>) => {
     setMessages(prev => prev.map(message => {
       if (message.id !== assistantId) return message;
@@ -2045,6 +2035,7 @@ export default function AiAssistantV2Page() {
       }
     } finally {
       flushStreamDelta();
+      settleRunningTools(assistantId);
       finishRun(user?.login, runId, runStatus, runError);
       if (runStatus !== 'done' && user?.login) {
         void latestRunSnapshot(user.login, activeSession?.id).then(snapshot => setResumableSnapshot(snapshot));
@@ -2117,6 +2108,7 @@ export default function AiAssistantV2Page() {
       }
     } finally {
       flushStreamDelta();
+      settleRunningTools(assistantId);
       finishRun(user?.login, snapshot.runId, runStatus, runError);
       if (runStatus !== 'done' && user?.login) {
         void latestRunSnapshot(user.login, activeSession?.id).then(snapshot => setResumableSnapshot(snapshot));
