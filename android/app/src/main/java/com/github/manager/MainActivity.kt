@@ -871,6 +871,21 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
+        // ── 【输入法】键盘避让 ──────────────────────────────────────
+        //   边到边模式下系统不再自动为 WebView 让出键盘高度：adjustResize 只改变窗口
+        //   可视区域，不会缩小 WebView 自身 → AI 助手等页面的底部输入框会被键盘盖住。
+        //   这里把 IME 高度补给 WebView 的底部 padding，等效于“缩小页面可视区”，
+        //   页面（含 fixed 底部输入条）会整体上移，停在键盘上方。
+        //   注：CodeBrowserPage 自己的 visualViewport 逻辑会因 innerHeight 同步缩小而归零，
+        //   不会与本处叠加出双倍间段。
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+            val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            if (view.paddingBottom != imeBottom) {
+                view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, imeBottom)
+            }
+            insets
+        }
+
         // 读取上次持久化的主题色，并同步应用到启动画面各元素
         applySavedAccentToSplash()
         // 冷启动时同步最近任务栏卡片颜色（与主题色方案保持一致）
