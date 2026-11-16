@@ -872,11 +872,28 @@ class MainActivity : AppCompatActivity() {
         }
 
         // ── 【输入法】键盘避让 ──────────────────────────────────────
-        //   边到边模式下系统不会自动缩小 WebView，实测本机型上 IME inset 也不会可靠地
-        //   到达 WebView 的子视图，所以在原生侧补 padding 无效；而且一旦生效又会与前端
-        //   补偿叠加。
-        //   因此统一改由前端 useKeyboardInset()（基于 visualViewport 差值）把底部
-        //   输入条顶到键盘上方；manifest 保留 adjustResize 以兼容旧机型窗口真实 resize 的情况。
+        //   真机结论：
+        //   ① 边到边之后系统不会缩小 WebView，键盘弹出时页面底部（输入条）直接被盖住；
+        //   ② 给 WebView 加 paddingBottom 无效 —— padding 只裁剪绘制区域，不改变 WebView
+        //      的实际布局高度，Chromium 拿不到新视口，页面不会重排；
+        //   ③ 正解是改布局参数：把「键盘高度 - 底部导航容器高度」作为 WebView 的
+        //      bottomMargin，WebView 真正变短 → 视口变化 → 页面重排，底部输入条浮到键盘之上。
+        //   键盘高度用 windowVisibleDisplayFrame 计算，不依赖 ime inset 是否派发（兼容性最好）；
+        //   前端另有 useKeyboardInset() 兜底：margin 生效后 innerHeight 会同步缩小，
+        //   前端算出的差值自动归零，不会双倍补偿。
+        val imeContentRoot = findViewById<View>(android.R.id.content)
+        imeContentRoot.viewTreeObserver.addOnGlobalLayoutListener {
+            val visible = android.graphics.Rect()
+            imeContentRoot.getWindowVisibleDisplayFrame(visible)
+            val keyboardHeight = (imeContentRoot.rootView.height - visible.bottom).coerceAtLeast(0)
+            val navHeight = if (bottomNavContainer.visibility == View.VISIBLE) bottomNavContainer.height else 0
+            val target = (keyboardHeight - navHeight).coerceAtLeast(0)
+            val lp = webView.layoutParams as android.view.ViewGroup.MarginLayoutParams
+            if (lp.bottomMargin != target) {
+                lp.bottomMargin = target
+                webView.layoutParams = lp
+            }
+        }
 
         // 读取上次持久化的主题色，并同步应用到启动画面各元素
         applySavedAccentToSplash()
