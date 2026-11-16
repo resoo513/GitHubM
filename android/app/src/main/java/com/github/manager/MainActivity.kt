@@ -872,19 +872,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         // ── 【输入法】键盘避让 ──────────────────────────────────────
-        //   边到边模式下系统不再自动为 WebView 让出键盘高度：adjustResize 只改变窗口
-        //   可视区域，不会缩小 WebView 自身 → AI 助手等页面的底部输入框会被键盘盖住。
-        //   这里把 IME 高度补给 WebView 的底部 padding，等效于“缩小页面可视区”，
-        //   页面（含 fixed 底部输入条）会整体上移，停在键盘上方。
-        //   注：CodeBrowserPage 自己的 visualViewport 逻辑会因 innerHeight 同步缩小而归零，
-        //   不会与本处叠加出双倍间段。
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
-            val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
-            if (view.paddingBottom != imeBottom) {
-                view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, imeBottom)
-            }
-            insets
-        }
+        //   边到边模式下系统不会自动缩小 WebView，实测本机型上 IME inset 也不会可靠地
+        //   到达 WebView 的子视图，所以在原生侧补 padding 无效；而且一旦生效又会与前端
+        //   补偿叠加。
+        //   因此统一改由前端 useKeyboardInset()（基于 visualViewport 差值）把底部
+        //   输入条顶到键盘上方；manifest 保留 adjustResize 以兼容旧机型窗口真实 resize 的情况。
 
         // 读取上次持久化的主题色，并同步应用到启动画面各元素
         applySavedAccentToSplash()
