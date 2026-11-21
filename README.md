@@ -159,9 +159,9 @@ Agent：get_workflow_runs → get_run_jobs → get_job_logs
 - **后台保活**：Android 端通过 `AndroidBridge.startAgentTask` 启动前台服务，切换后台任务继续跑
 - **auto_review 规则**：硬编码密钥 / Token、TODO-FIXME 遗留、`await` 缺少 try-catch、`console.log` 残留、超长行（>120）、过长函数（>80 行）
 
-### 移动端网络适配：LLM Proxy（可选）
+### 移动端网络适配：LLM Proxy（可选、自建）
 
-Android WebView 下部分模型 API 受 CORS / DNS 影响，项目内置一个**无状态** Cloudflare Worker 代理（`cloudflare/llm-proxy`）：只转发请求与 SSE 流，不保存会话、不记录 API Key、不跑 Agent 循环，并对上游地址做白名单校验。
+默认直连各模型官方接口，**API Key 不经过任何第三方服务器**。只有部分网络环境下遇到 CORS / DNS 问题时，才需要自行部署一个**无状态** Cloudflare Worker 代理（`cloudflare/llm-proxy`），然后在设置里显式填写代理地址：代理只转发请求与 SSE 流，不保存会话、不记录 API Key、不跑 Agent 循环，并对上游地址做白名单校验。
 
 ```http
 POST /v1/chat/completions
@@ -214,7 +214,7 @@ npx wrangler deploy
 ┌───────▼──────────┐   ┌────────▼────────────────┐
 │  api.github.com  │   │  LLM Provider / MCP     │
 └──────────────────┘   └─────────────────────────┘
-        ▲ 无中转服务器，Token 仅存本机 localStorage
+        ▲ 无中转服务器；Android Token 由 Keystore 加密保存
 ```
 
 ---
@@ -258,8 +258,7 @@ GitHubM/
 │   └── routes.tsx                # 路由表（public / 受保护）
 ├── .skills/                      # 80+ 能力包（OCR、图像/视频生成、检索、支付等）
 ├── .rules/                       # ast-grep 自定义 lint 规则 + check.sh
-├── scripts/                      # i18n 同步、keystore Secrets 配置等工具脚本
-├── docs/prd.md                   # 产品需求文档
+├── scripts/                      # keystore Secrets 配置等工具脚本
 ├── index.html                    # 主题预初始化脚本（防 FOUC）
 ├── vite.config.ts                # base "./" · 移除 crossorigin · WebView 构建优化
 └── tailwind.config.js · biome.json · tsconfig*.json
@@ -323,7 +322,7 @@ pnpm dev            # 启动开发服务器 http://localhost:5173
 | `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` | 若使用 Supabase 相关能力时配置 |
 | `VITE_APP_VERSION` | 由 CI 注入，格式 `1.0.<run_number>`；本地开发为 `undefined` |
 
-AI 模型的 API Key 不放在 `.env`，而是登录后在**设置 → AI 配置**中填写，仅保存到本机 localStorage。
+AI 模型的 API Key 不放在 `.env`，而是登录后在**设置 → AI 配置**中填写：Android 端由系统 Keystore 加密保存，Web 端回退 localStorage。
 
 ---
 
@@ -386,20 +385,29 @@ pnpm tauri build
 
 ## 签名与发布
 
-APK 默认使用仓库内置 `android/release.keystore` 签名，保证跨版本覆盖安装。若要使用自有证书：
+Release APK 使用保存在 **GitHub Actions Secrets** 中的签名证书，仓库中不包含任何 keystore。
+
+每次构建自动读取以下 Secrets，不需要手动提交签名：
+
+| Secret | 内容 |
+|---|---|
+| `RELEASE_KEYSTORE_BASE64` | `release.keystore` 的 base64 |
+| `RELEASE_KEY_ALIAS` | 密钥别名，当前为 `github-manager` |
+| `RELEASE_STORE_PASSWORD` | keystore 口令 |
+| `RELEASE_KEY_PASSWORD` | key 口令 |
+
+缺少任意一项时构建会直接失败，不会回退到仓库内证书或临时证书。
 
 ```bash
-# 推荐：脚本自动写入 4 个 Actions Secrets（需已 gh auth login）
-bash scripts/setup-keystore-secrets.sh
+# 从离线备份恢复后，一次性写入 Secrets（需要 gh auth login）
+RELEASE_STORE_PASSWORD='...' RELEASE_KEY_PASSWORD='...' \
+  bash scripts/setup-keystore-secrets.sh /path/to/release.keystore
 ```
 
-或在 **Settings → Secrets and variables → Actions** 手动添加：`RELEASE_KEYSTORE_BASE64`、`RELEASE_KEY_ALIAS`、`RELEASE_STORE_PASSWORD`、`RELEASE_KEY_PASSWORD`。
-
-CI 还支持**零配置自动持久化**：若上述 Secret 缺失但配置了 `GH_PAT`（需 `repo` 权限），首次构建会自动生成 Keystore 并回写到 Secrets，后续构建复用同一证书。
-
-> ⚠️ 生产使用请替换为你自己的 keystore，不要沿用仓库中的示例证书。签名不一致会导致无法覆盖安装。
+> ⚠️ **v1.0.593 起更换了 Release 签名证书。** 从 v1.0.592 或更早版本升级必须先卸载旧版；卸载会清除登录状态和 AI 配置。之后版本可正常覆盖安装。
 
 ---
+
 
 ## CI/CD
 
@@ -438,7 +446,7 @@ tag v* ────► tauri-build（三平台桌面安装包）
 <details>
 <summary><b>AI 助手在手机上请求失败（CORS / 网络错误）</b></summary>
 
-部分模型域名在 WebView 下受 CORS 或 DNS 限制，部署 `cloudflare/llm-proxy` 后在「设置 → AI 配置」填写代理地址即可，代理不保存任何凭据。
+应用默认直连模型官方接口。如果所在网络确实无法直连，可自行部署 `cloudflare/llm-proxy`，再在「设置 → AI 配置 → 模型代理」填写地址；不填写时不会走任何代理。
 </details>
 
 <details>
@@ -463,8 +471,8 @@ tag v* ────► tauri-build（三平台桌面安装包）
 
 ## 隐私与安全
 
-- **GitHub Token** 仅存于本机 localStorage，所有请求直连 `api.github.com`，不经过任何第三方服务器
-- **模型 API Key** 同样仅本地保存；使用 LLM Proxy 时代理不记录请求体与 Authorization
+- **GitHub Token** 仅存本机：Android 使用 Android Keystore 加密后写入私有 SharedPreferences，Web 端回退 localStorage；所有请求直连 `api.github.com`，不经过任何第三方服务器
+- **模型 API Key** 同样仅本地保存；默认只发送到模型官方域名，不经过第三方。只有在设置中手动填写代理地址时，请求才会经该代理转发（代理不记录请求体与 Authorization）
 - **访问统计** 完全本地计算 PV / UV，无上报
 - **代码安全**：`check_security` 工具与 `auto_review` 规则会扫描硬编码密钥、`eval`、SQL 注入、XSS 等常见风险
 - **依赖忽略**：`.gitignore` 已排除 `node_modules`、`dist`、`*.keystore`（示例证书除外）、`local.properties` 等

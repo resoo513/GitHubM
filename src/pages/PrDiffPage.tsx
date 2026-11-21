@@ -100,7 +100,8 @@ function groupCommentsByLine(comments: GitHubComment[]): Map<string, LineComment
     const raw = c as unknown as Record<string, unknown>;
     const path = (raw['path'] as string) ?? '';
     const line = (raw['line'] as number) ?? (raw['original_line'] as number) ?? 0;
-    const key = `${path}:${line}`;
+    const side = raw['side'] === 'LEFT' ? 'LEFT' : 'RIGHT';
+    const key = `${path}:${side}:${line}`;
     if (!map.has(key)) map.set(key, { path, line, comments: [] });
     map.get(key)!.comments.push(c);
   }
@@ -173,7 +174,6 @@ interface UnifiedDiffProps {
 }
 
 function UnifiedDiff({ file, commentGroups, prHead, owner, repo, pullNumber, onCommentAdded }: UnifiedDiffProps) {
-  const [collapsed, setCollapsed] = useState(false);
   const [activeCommentLine, setActiveCommentLine] = useState<number | null>(null);
   const { user } = useAuth();
 
@@ -187,7 +187,7 @@ function UnifiedDiff({ file, commentGroups, prHead, owner, repo, pullNumber, onC
 
   const lines = parsePatch(file.patch);
 
-  const handleAddComment = async (body: string, lineNum: number) => {
+  const handleAddComment = async (body: string, lineNum: number, side: 'LEFT' | 'RIGHT') => {
     if (!owner || !repo) return;
     try {
       const comment = await createPullRequestReviewComment(owner, repo, pullNumber, {
@@ -195,7 +195,7 @@ function UnifiedDiff({ file, commentGroups, prHead, owner, repo, pullNumber, onC
         commit_id: prHead,
         path: file.filename,
         line: lineNum,
-        side: 'RIGHT',
+        side,
       });
       onCommentAdded(comment, file.filename, lineNum);
       setActiveCommentLine(null);
@@ -210,9 +210,10 @@ function UnifiedDiff({ file, commentGroups, prHead, owner, repo, pullNumber, onC
     <div className="overflow-x-auto">
       <table className="w-full min-w-max text-xs font-mono border-collapse">
         <tbody>
-          {collapsed ? null : lines.map((line, idx) => {
-            const lineNum = line.lineNew ?? line.lineOld ?? 0;
-            const commentKey = `${file.filename}:${lineNum}`;
+          {lines.map((line, idx) => {
+            const side: 'LEFT' | 'RIGHT' = line.type === 'remove' ? 'LEFT' : 'RIGHT';
+            const lineNum = side === 'RIGHT' ? (line.lineNew ?? 0) : (line.lineOld ?? 0);
+            const commentKey = `${file.filename}:${side}:${lineNum}`;
             const group = commentGroups.get(commentKey);
             const isCommentActive = activeCommentLine === idx;
 
@@ -284,7 +285,7 @@ function UnifiedDiff({ file, commentGroups, prHead, owner, repo, pullNumber, onC
                 {isCommentActive && (
                   <InlineCommentInput
                     key={`input-${idx}`}
-                    onSubmit={(body) => handleAddComment(body, lineNum)}
+                    onSubmit={(body) => handleAddComment(body, lineNum, side)}
                     onCancel={() => setActiveCommentLine(null)}
                   />
                 )}
@@ -467,6 +468,8 @@ function SideBySideDiff({ file, commentGroups, prHead, owner, repo, pullNumber, 
 interface FileDiffCardProps {
   file: GitHubFile;
   mode: 'unified' | 'side';
+  collapsed: boolean;
+  onToggle: () => void;
   commentGroups: Map<string, LineCommentGroup>;
   prHead: string;
   owner: string;
@@ -475,8 +478,7 @@ interface FileDiffCardProps {
   onCommentAdded: (c: GitHubComment, path: string, line: number) => void;
 }
 
-function FileDiffCard({ file, mode, commentGroups, prHead, owner, repo, pullNumber, onCommentAdded }: FileDiffCardProps) {
-  const [collapsed, setCollapsed] = useState(false);
+function FileDiffCard({ file, mode, collapsed, onToggle, commentGroups, prHead, owner, repo, pullNumber, onCommentAdded }: FileDiffCardProps) {
 
   const statusColor =
     file.status === 'added' ? 'text-success border-success/30 bg-success/10' :
@@ -488,7 +490,7 @@ function FileDiffCard({ file, mode, commentGroups, prHead, owner, repo, pullNumb
       {/* 文件头 */}
       <div
         className="flex items-center gap-2 px-3 py-2.5 bg-secondary/40 border-b border-border cursor-pointer hover:bg-secondary/70 transition-colors"
-        onClick={() => setCollapsed(!collapsed)}
+        onClick={onToggle}
       >
         <button type="button" className="shrink-0 text-muted-foreground">
           {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
@@ -527,6 +529,8 @@ export default function PrDiffPage() {
   const [reviewComments, setReviewComments] = useState<GitHubComment[]>([]);
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState<'unified' | 'side'>(isMobile ? 'unified' : 'side');
+  // 逐个文件独立记忆折叠状态，让全部展开/全部折叠与单文件切换能共存
+  const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
 
   // 快速评审 Dialog
   const [reviewDialog, setReviewDialog] = useState<ReviewEvent | null>(null);
@@ -561,6 +565,16 @@ export default function PrDiffPage() {
   }, [owner, repo, number]);
 
   const commentGroups = groupCommentsByLine(reviewComments);
+  const allCollapsed = files.length > 0 && files.every((item) => collapsedFiles.has(item.filename));
+
+  const toggleFile = (filename: string) => {
+    setCollapsedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(filename)) next.delete(filename);
+      else next.add(filename);
+      return next;
+    });
+  };
 
   const handleCommentAdded = (comment: GitHubComment, _path: string, _line: number) => {
     setReviewComments((prev) => [...prev, comment]);
@@ -690,8 +704,9 @@ export default function PrDiffPage() {
         </div>
       </div>
 
-      {/* 展示模式切换 */}
-      <div className="flex items-center gap-1 bg-secondary rounded-lg p-1 w-fit">
+      {/* 展示模式与折叠控制 */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-1 bg-secondary rounded-lg p-1 w-fit">
         <button
           type="button"
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs transition-colors ${mode === 'unified' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
@@ -707,6 +722,25 @@ export default function PrDiffPage() {
           <Columns2 className="w-3.5 h-3.5" />
           {i18n.t('分屏视图')}</button>
       </div>
+        <div className="flex items-center gap-1 bg-secondary rounded-lg p-1 w-fit">
+          <button
+            type="button"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
+            onClick={() => setCollapsedFiles(new Set())}
+            disabled={collapsedFiles.size === 0}
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+            {i18n.t('全部展开')}</button>
+          <button
+            type="button"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
+            onClick={() => setCollapsedFiles(new Set(files.map((item) => item.filename)))}
+            disabled={allCollapsed}
+          >
+            <ChevronUp className="w-3.5 h-3.5" />
+            {i18n.t('全部折叠')}</button>
+        </div>
+      </div>
 
       {/* 文件 Diff 列表 */}
       <div className="space-y-3">
@@ -715,6 +749,8 @@ export default function PrDiffPage() {
             key={file.filename}
             file={file}
             mode={mode}
+            collapsed={collapsedFiles.has(file.filename)}
+            onToggle={() => toggleFile(file.filename)}
             commentGroups={commentGroups}
             prHead={pr.head.sha}
             owner={owner!}

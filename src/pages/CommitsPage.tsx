@@ -38,9 +38,13 @@ import { UserLink } from '@/components/common/UserLink';
 import { toast } from 'sonner';
 import { pageCache } from '@/lib/page-cache';
 import i18n from "@/i18n";
+import { useAuth } from "@/contexts/AuthContext";
+import { isRepoOwner } from "@/lib/repoPermissions";
 
 export default function CommitsPage() {
   const { owner, repo } = useParams<{ owner: string; repo: string }>();
+  const { user } = useAuth();
+  const canManage = isRepoOwner(owner, user?.login);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const branchParam = searchParams.get('branch') || '';
@@ -274,7 +278,7 @@ export default function CommitsPage() {
                 </Button>
                 <Button
                   variant="ghost" size="sm"
-                  className="h-8 px-2 text-xs gap-1.5 text-muted-foreground hover:bg-secondary hover:text-primary"
+                  className={`h-8 px-2 text-xs gap-1.5 text-muted-foreground hover:bg-secondary hover:text-primary ${canManage ? '' : 'hidden'}`}
                   title={i18n.t('撤销提交（创建反向提交）')}
                   onClick={() => { setActionCommit(commit); setActionKind('revert'); }}
                 >
@@ -282,7 +286,7 @@ export default function CommitsPage() {
                 </Button>
                 <Button
                   variant="ghost" size="sm"
-                  className="h-8 px-2 text-xs gap-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                    className={`h-8 px-2 text-xs gap-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive ${canManage ? '' : 'hidden'}`}
                   title={i18n.t('回滚分支到此提交（会移动分支）')}
                   onClick={() => { setActionCommit(commit); setActionKind('rollback'); }}
                 >

@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import type { GitHubUser, GitHubRateLimit, SavedAccount } from '@/types/types';
 import { getCurrentUser, getRateLimit, setToken } from '@/services/github';
 import { pageCache } from '@/lib/page-cache';
+import { getSecureItem, setSecureItem, removeSecureItem } from '@/lib/secureStorage';
 
 interface AuthContextValue {
   token: string | null;
@@ -33,19 +34,19 @@ const ACCOUNTS_KEY = 'github_manager_accounts';
 
 function loadAccounts(): SavedAccount[] {
   try {
-    return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '[]');
+    return JSON.parse(getSecureItem(ACCOUNTS_KEY) || '[]');
   } catch {
     return [];
   }
 }
 
 function saveAccounts(accounts: SavedAccount[]) {
-  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
+  setSecureItem(ACCOUNTS_KEY, JSON.stringify(accounts));
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setTokenState] = useState<string | null>(() =>
-    localStorage.getItem(TOKEN_KEY)
+    getSecureItem(TOKEN_KEY)
   );
   const [user, setUser] = useState<GitHubUser | null>(null);
   const [rateLimit, setRateLimit] = useState<GitHubRateLimit | null>(null);
@@ -72,26 +73,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = useCallback(async (newToken: string) => {
+    const previousToken = token;
     setToken(newToken);
-    const userData = await getCurrentUser();
-    localStorage.setItem(TOKEN_KEY, newToken);
-    setTokenState(newToken);
-    setUser(userData);
-    setIsAuthenticated(true);
-    persistAccount(newToken, userData);
-    refreshRateLimit();
-  }, [refreshRateLimit, persistAccount]);
+    try {
+      const userData = await getCurrentUser();
+      setSecureItem(TOKEN_KEY, newToken);
+      setTokenState(newToken);
+      setUser(userData);
+      setIsAuthenticated(true);
+      persistAccount(newToken, userData);
+      refreshRateLimit();
+    } catch (error) {
+      // 校验失败时回滚模块级 token，避免「界面还是旧用户、请求全 401」的半登出状态。
+      setToken(previousToken);
+      throw error;
+    }
+  }, [token, refreshRateLimit, persistAccount]);
 
   const switchAccount = useCallback(async (switchToken: string) => {
+    const previousToken = token;
     setToken(switchToken);
-    const userData = await getCurrentUser();
-    localStorage.setItem(TOKEN_KEY, switchToken);
-    setTokenState(switchToken);
-    setUser(userData);
-    setIsAuthenticated(true);
-    persistAccount(switchToken, userData);
-    refreshRateLimit();
-  }, [refreshRateLimit, persistAccount]);
+    try {
+      const userData = await getCurrentUser();
+      setSecureItem(TOKEN_KEY, switchToken);
+      setTokenState(switchToken);
+      setUser(userData);
+      setIsAuthenticated(true);
+      persistAccount(switchToken, userData);
+      refreshRateLimit();
+    } catch (error) {
+      setToken(previousToken);
+      throw error;
+    }
+  }, [token, refreshRateLimit, persistAccount]);
 
   const removeAccount = useCallback((removeToken: string) => {
     setSavedAccounts((prev) => {
@@ -150,7 +164,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [token]);
 
   const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
+    removeSecureItem(TOKEN_KEY);
     setToken(null);
     setTokenState(null);
     setUser(null);
@@ -161,7 +175,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // 初始化时自动验证已保存的令牌
   useEffect(() => {
-    const savedToken = localStorage.getItem(TOKEN_KEY);
+    const savedToken = getSecureItem(TOKEN_KEY);
     if (savedToken) {
       setToken(savedToken);
       getCurrentUser()
@@ -171,7 +185,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           refreshRateLimit();
         })
         .catch(() => {
-          localStorage.removeItem(TOKEN_KEY);
+          removeSecureItem(TOKEN_KEY);
           setTokenState(null);
           setToken(null);
         })

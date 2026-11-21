@@ -16,6 +16,7 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
 import android.view.View
+import android.view.ViewTreeObserver
 import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
@@ -60,6 +61,7 @@ private const val WARM_START_WINDOW_MS = 10 * 60 * 1000L
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private var imeLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
     private lateinit var splashOverlay: View
     private lateinit var bottomNav: BottomNavigationView
     private lateinit var bottomNavContainer: android.widget.LinearLayout
@@ -270,6 +272,33 @@ class MainActivity : AppCompatActivity() {
     inner class WebAppBridge {
 
         /** React 首屏就绪后调用，与 3s 最小时间共同触发启动遮罩淡出 */
+        /**
+         * Token 安全存储：Android Keystore 加密后写入私有 SharedPreferences。
+         * 前端通过 src/lib/secureStorage.ts 读写，Web 端仍回退 localStorage。
+         */
+        @JavascriptInterface
+        fun secureGet(key: String): String? = try {
+            SecureStore.get(this@MainActivity, key)
+        } catch (_: Exception) {
+            null
+        }
+
+        @JavascriptInterface
+        fun secureSet(key: String, value: String): Boolean = try {
+            SecureStore.put(this@MainActivity, key, value)
+        } catch (_: Exception) {
+            false
+        }
+
+        @JavascriptInterface
+        fun secureRemove(key: String) {
+            try {
+                SecureStore.remove(this@MainActivity, key)
+            } catch (_: Exception) {
+                // ignore
+            }
+        }
+
         @JavascriptInterface
         fun notifyReady() {
             webViewReadyReceived = true
@@ -871,6 +900,32 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
+        // ── 【输入法】键盘避让 ──────────────────────────────────────
+        //   真机结论：
+        //   ① 边到边之后系统不会缩小 WebView，键盘弹出时页面底部（输入条）直接被盖住；
+        //   ② 给 WebView 加 paddingBottom 无效 —— padding 只裁剪绘制区域，不改变 WebView
+        //      的实际布局高度，Chromium 拿不到新视口，页面不会重排；
+        //   ③ 正解是改布局参数：把「键盘高度 - 底部导航容器高度」作为 WebView 的
+        //      bottomMargin，WebView 真正变短 → 视口变化 → 页面重排，底部输入条浮到键盘之上。
+        //   键盘高度用 windowVisibleDisplayFrame 计算，不依赖 ime inset 是否派发（兼容性最好）；
+        //   前端另有 useKeyboardInset() 兜底：margin 生效后 innerHeight 会同步缩小，
+        //   前端算出的差值自动归零，不会双倍补偿。
+        val imeContentRoot = findViewById<View>(android.R.id.content)
+        val imeListener = ViewTreeObserver.OnGlobalLayoutListener {
+            val visible = android.graphics.Rect()
+            imeContentRoot.getWindowVisibleDisplayFrame(visible)
+            val keyboardHeight = (imeContentRoot.rootView.height - visible.bottom).coerceAtLeast(0)
+            val navHeight = if (bottomNavContainer.visibility == View.VISIBLE) bottomNavContainer.height else 0
+            val target = (keyboardHeight - navHeight).coerceAtLeast(0)
+            val lp = webView.layoutParams as android.view.ViewGroup.MarginLayoutParams
+            if (lp.bottomMargin != target) {
+                lp.bottomMargin = target
+                webView.layoutParams = lp
+            }
+        }
+        imeLayoutListener = imeListener
+        imeContentRoot.viewTreeObserver.addOnGlobalLayoutListener(imeListener)
+
         // 读取上次持久化的主题色，并同步应用到启动画面各元素
         applySavedAccentToSplash()
         // 冷启动时同步最近任务栏卡片颜色（与主题色方案保持一致）
@@ -980,6 +1035,10 @@ class MainActivity : AppCompatActivity() {
                 .apply()
         }
         splashHandler.removeCallbacksAndMessages(null)
+        imeLayoutListener?.let { listener ->
+            findViewById<View>(android.R.id.content)?.viewTreeObserver?.removeOnGlobalLayoutListener(listener)
+        }
+        imeLayoutListener = null
         // webView 为 lateinit，若 onCreate 未完成初始化需防止 NPE
         if (::webView.isInitialized) {
             webView.stopLoading()
@@ -1021,6 +1080,11 @@ class MainActivity : AppCompatActivity() {
             // 解决 Vite 打包后相对路径资源在 WebView 中被跨域拦截导致的白屏问题
             @Suppress("SetJavaScriptEnabled")
             allowFileAccessFromFileURLs = true
+            // file:// 页面（index.html）向本机 http 服务（如 127.0.0.1:17890）发请求时，
+            // 本地反代往往不返回 CORS 响应头；API 29 及以下需放开 file:// 的跨域访问，
+            // 否则 fetch 只会得到笼统的 “Failed to fetch”。（API 30+ 该开关会被系统忽略）
+            @Suppress("SetJavaScriptEnabled")
+            allowUniversalAccessFromFileURLs = true
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
             useWideViewPort = true

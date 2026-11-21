@@ -1,10 +1,12 @@
 import React, { useEffect } from 'react';
 import { HashRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { Toaster } from '@/components/ui/sonner';
+import { ConfirmDialogHost } from '@/components/ui/confirm-dialog';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import MainLayout from '@/components/layouts/MainLayout';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { NetworkStatusBanner } from '@/components/NetworkStatusBanner';
+import { GitHubRateLimitBanner } from '@/components/system/GitHubRateLimitBanner';
 import LaunchUpdateChecker from '@/components/system/LaunchUpdateChecker';
 import RouteScrollManager from '@/components/system/RouteScrollManager';
 import { routes } from './routes';
@@ -104,7 +106,9 @@ function AppContent() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       <NetworkStatusBanner />
+      <GitHubRateLimitBanner />
       <Toaster richColors position="top-right" />
+      <ConfirmDialogHost />
     </>
   );
 }

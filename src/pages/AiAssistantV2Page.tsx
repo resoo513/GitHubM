@@ -38,6 +38,8 @@ import {
 import type { SessionIndex, V2Session } from '@/ai-v2/sessionStore';
 import { appendBlockDelta, appendToolBlock, buildRenderGroups, ensureBlocks } from '@/ai-v2/blocks';
 import AiExecutionPanel from '@/components/ai/AiExecutionPanel';
+import { ConversationTurnView, buildTurns } from '@/components/ai/ChatTurn';
+import type { ConversationTurn } from '@/components/ai/ChatTurn';
 import { deriveSessionTitle } from '@/ai-v2/sessionTitle';
 import { extractPdfText, MAX_PDF_BYTES } from '@/ai-v2/pdf';
 import RepoSelector from '@/components/ai/RepoSelector';
@@ -47,6 +49,7 @@ import {
   getModelDef,
   loadModelConfig,
   loadProviderKey,
+  modelDisplayName,
   renderMarkdown,
 } from '@/components/ai/aiUtils';
 import type { ModelType } from '@/components/ai/aiTypes';
@@ -54,7 +57,9 @@ import { getModelCapabilities } from '@/ai-v2/modelCapabilities';
 import type { ModelConfig } from '@/components/ai/aiTypes';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { GitHubRepo } from '@/types/types';
+import { useKeyboardInset } from '@/hooks/use-keyboard-inset';
 import { Button } from '@/components/ui/button';
+import { confirmAction } from '@/components/ui/confirm-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -108,9 +113,8 @@ const MAX_SESSIONS = 20;
 const MAX_SAVED_MESSAGES = 40;
 const MAX_TOOL_RESULT = 4000;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const MAX_USER_MESSAGE_CHARS = 4000;
-const USER_MESSAGE_PREVIEW_CHARS = 2000;
-const STREAMING_PLAIN_LIMIT = 400_000;
+/** 流式增量合并窗口（毫秒）：只做渲染合批，不做速度限制 */
+const STREAM_FLUSH_MS = 24;
 
 function readFileAsDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -125,7 +129,6 @@ const CLOUDFLARE_FALLBACK_CONFIG: ModelConfig = {
   type: 'cloudflare',
   api_key: 'cloudflare-free',
   model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  proxy_url: 'https://llm.callact.xyz',
 };
 
 function isOpenRouterDailyLimit(message: string): boolean {
@@ -240,343 +243,6 @@ function groupSessions(sessions: V2Session[]): Array<{ label: string; items: V2S
   return groups.filter(group => group.items.length > 0);
 }
 
-function ReasoningPanel({ text, streaming }: { text: string; streaming?: boolean }) {
-  const [open, setOpen] = useState(Boolean(streaming));
-  useEffect(() => {
-    if (!streaming) setOpen(false);
-  }, [streaming]);
-  if (!text) return null;
-  return (
-    <div className="min-w-0">
-      <button
-        type="button"
-        onClick={() => setOpen(prev => !prev)}
-        className="inline-flex items-center gap-1 py-0.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
-      >
-        <span>{streaming ? i18n.t('思考中') : i18n.t('已思考')}</span>
-        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-      </button>
-      {open && (
-        <div className="mt-1.5 whitespace-pre-wrap border-l-2 border-border/70 pl-3 text-[13px] leading-6 text-muted-foreground">
-          {text}
-        </div>
-      )}
-    </div>
-  );
-}
-function ToolCard({ tool, onOpenArtifact }: { tool: UiToolRun; onOpenArtifact: (meta: ArtifactMeta) => void }) {
-  const [open, setOpen] = useState(false);
-  const duration = tool.startedAt && tool.endedAt
-    ? `${Math.max(0.1, (tool.endedAt - tool.startedAt) / 1000).toFixed(1)}s`
-    : '';
-  const statusIcon = tool.status === 'running'
-    ? <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-    : tool.status === 'done'
-      ? <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
-      : <XCircle className="h-3.5 w-3.5 text-destructive" />;
-
-  return (
-    <div className={cn(
-      'overflow-hidden rounded-lg border bg-card/70',
-      tool.status === 'error' ? 'border-destructive/30' : 'border-border',
-    )}>
-      <button
-        type="button"
-        onClick={() => setOpen(prev => !prev)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-muted/35"
-      >
-        <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-mono">{toolCallLabel({ id: tool.id, name: tool.name, arguments: tool.arguments })}</span>
-        {duration && <span className="shrink-0 text-[10px] text-muted-foreground">{duration}</span>}
-        {statusIcon}
-        {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
-      </button>
-      {open && (
-        <div className="space-y-2 border-t border-border px-3 py-2">
-          <div>
-            <p className="mb-1 text-[10px] font-medium text-muted-foreground">{i18n.t('参数')}</p>
-            <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted/50 p-2 text-[10px] font-mono">{tool.arguments || '{}'}</pre>
-          </div>
-          <div>
-            <p className="mb-1 text-[10px] font-medium text-muted-foreground">{i18n.t('结果')}</p>
-            {tool.status === 'running' ? (
-              <p className="text-xs text-muted-foreground">{i18n.t('正在执行…')}</p>
-            ) : (
-              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/50 p-2 text-[10px] font-mono">{tool.content || i18n.t('无输出')}</pre>
-            )}
-            {tool.artifact && (
-              <button
-                type="button"
-                onClick={() => onOpenArtifact(tool.artifact!)}
-                className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-primary/25 bg-primary/5 px-2 py-1 text-[10px] text-primary hover:bg-primary/10"
-              >
-                <Eye className="h-3 w-3" />
-                {i18n.t('查看完整结果')} · {tool.artifact.size.toLocaleString()} {i18n.t('字符')}
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ToolActivity({ tools, onOpenArtifact }: { tools: UiToolRun[]; onOpenArtifact: (meta: ArtifactMeta) => void }) {
-  if (!tools.length) return null;
-  return (
-    <div className="my-2 space-y-1.5 border-l-2 border-primary/20 pl-2.5">
-      <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-        <Zap className="h-3 w-3" />
-        {i18n.t('工具调用')}
-        <span className="rounded-full bg-muted px-1.5 text-[9px]">{tools.length}</span>
-      </div>
-      {tools.map(tool => <ToolCard key={tool.id} tool={tool} onOpenArtifact={onOpenArtifact} />)}
-    </div>
-  );
-}
-
-function AssistantTextBlock({ text, streaming, error, onApplyDiff }: {
-  text: string;
-  streaming?: boolean;
-  error?: boolean;
-  onApplyDiff: (path: string, diff: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  // 流式阶段不解析 Markdown：只渲染纯文本，流结束后再渲染一次
-  const base = streaming && text.length > STREAMING_PLAIN_LIMIT
-    ? `…
-${text.slice(-STREAMING_PLAIN_LIMIT)}`
-    : text;
-  const isLong = !streaming && base.length > 12000;
-  const display = isLong && !expanded ? `${base.slice(0, 12000)}
-
-…` : base;
-  return (
-    <div className={cn(
-      'min-w-0 text-[15px] leading-7 break-words',
-      error ? 'text-destructive' : 'text-foreground',
-    )}>
-      {streaming ? (
-        <p className="whitespace-pre-wrap break-words">
-          {display}
-          <span className="ml-0.5 inline-block h-4 w-1 animate-pulse rounded-sm bg-primary align-middle" />
-        </p>
-      ) : (
-        renderMarkdown(display, onApplyDiff)
-      )}
-      {isLong && (
-        <button
-          type="button"
-          onClick={() => setExpanded(value => !value)}
-          className="mt-1 text-[10px] text-primary hover:underline"
-        >
-          {expanded ? i18n.t('收起内容') : i18n.t('展开全文')}
-        </button>
-      )}
-    </div>
-  );
-}
-
-function AssistantTurn({ message, onOpenArtifact, onApplyDiff }: {
-  message: UiChatMessage;
-  onOpenArtifact: (meta: ArtifactMeta) => void;
-  onApplyDiff: (path: string, diff: string) => void;
-}) {
-  const blocks = message.blocks || [];
-  const tools = message.tools || [];
-  const isStreaming = Boolean(message.streaming);
-
-  const hasBody = blocks.length > 0 || Boolean(message.content || message.reasoning) || tools.length > 0;
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(message.content);
-      toast.success(i18n.t('已复制回答'));
-    } catch {
-      toast.error(i18n.t('复制失败'));
-    }
-  };
-
-  // 新消息按区块顺序渲染：思考 → 工具 → 正文 → 工具 → 正文…
-  // 区块合并成展示分组：连续工具调用收进执行面板，正文保持独立
-  const groups = buildRenderGroups(blocks);
-  const lastGroupIndex = groups.length - 1;
-  const renderedBlocks = groups.map((group, index) => {
-    const isLast = index === lastGroupIndex;
-    if (group.kind === 'reasoning') {
-      return <ReasoningPanel key={group.id} text={group.text} streaming={isStreaming && isLast} />;
-    }
-    if (group.kind === 'execution') {
-      const groupTools = group.toolIds
-        .map(id => tools.find(item => item.id === id))
-        .filter((tool): tool is UiToolRun => Boolean(tool));
-      if (!groupTools.length) return null;
-      return (
-        <AiExecutionPanel
-          key={group.id}
-          tools={groupTools}
-          onOpenArtifact={onOpenArtifact}
-        />
-      );
-    }
-    return (
-      <AssistantTextBlock
-        key={group.id}
-        text={group.text}
-        streaming={isStreaming && isLast}
-        error={message.error && isLast}
-        onApplyDiff={onApplyDiff}
-      />
-    );
-  });
-
-  return (
-    <div className="min-w-0">
-      {groups.length > 0 ? (
-        <div className="space-y-2">{renderedBlocks}</div>
-      ) : (
-        <>
-          <ReasoningPanel text={message.reasoning || ''} streaming={message.streaming} />
-          <ToolActivity tools={tools} onOpenArtifact={onOpenArtifact} />
-          {message.content ? (
-            <AssistantTextBlock
-              text={message.content}
-              streaming={isStreaming}
-              error={message.error}
-              onApplyDiff={onApplyDiff}
-            />
-          ) : null}
-        </>
-      )}
-
-      {isStreaming && !hasBody && (
-        <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          {i18n.t('思考中…')}
-        </div>
-      )}
-
-      {!message.streaming && (message.content || message.metrics) && (
-        <div className="mt-2 flex flex-wrap items-center gap-3">
-          {message.content && (
-            <button
-              type="button"
-              onClick={copy}
-              title={i18n.t('复制')}
-              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <Copy className="h-4 w-4" />
-            </button>
-          )}
-          {message.metrics && (
-            <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/70">
-              {message.metrics.totalTokens ? <span>{message.metrics.totalTokens} tokens</span> : null}
-              {message.metrics.firstTokenMs ? <span>首字 {Math.round(message.metrics.firstTokenMs / 100) / 10}s</span> : null}
-              {message.metrics.durationMs ? <span>总耗时 {Math.round(message.metrics.durationMs / 100) / 10}s</span> : null}
-              {message.metrics.model ? <span className="max-w-[180px] truncate font-mono">{message.metrics.model}</span> : null}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-interface ConversationTurn {
-  id: string;
-  user: UiChatMessage | null;
-  assistants: UiChatMessage[];
-}
-
-function buildTurns(messages: UiChatMessage[]): ConversationTurn[] {
-  const turns: ConversationTurn[] = [];
-  let current: ConversationTurn | null = null;
-  for (const message of messages) {
-    if (message.role === 'user') {
-      current = { id: message.id, user: message, assistants: [] };
-      turns.push(current);
-      continue;
-    }
-    if (!current) {
-      current = { id: message.id, user: null, assistants: [] };
-      turns.push(current);
-    }
-    current.assistants.push(message);
-  }
-  return turns;
-}
-
-function ConversationTurnView({ turn, onOpenArtifact, onApplyDiff }: {
-  turn: ConversationTurn;
-  index: number;
-  onOpenArtifact: (meta: ArtifactMeta) => void;
-  onApplyDiff: (path: string, diff: string) => void;
-}) {
-  const [userExpanded, setUserExpanded] = useState(false);
-  const userContent = turn.user?.content || '';
-  const userIsLong = userContent.length > MAX_USER_MESSAGE_CHARS;
-  const shownUserContent = userIsLong && !userExpanded
-    ? `${userContent.slice(0, USER_MESSAGE_PREVIEW_CHARS)}\n\n…`
-    : userContent;
-
-  return (
-    <section className="flex min-w-0 flex-col gap-3">
-      {turn.user && (
-        <div className="flex min-w-0 flex-col items-end gap-1.5">
-          <div className="max-w-[86%] min-w-0 rounded-2xl rounded-br-md bg-muted px-3.5 py-2.5 text-[15px] leading-7 text-foreground">
-            <span className="whitespace-pre-wrap break-words">{shownUserContent}</span>
-            {userIsLong && (
-              <button
-                type="button"
-                onClick={() => setUserExpanded(value => !value)}
-                className="mt-1 block text-[10px] text-primary underline-offset-2 hover:underline"
-              >
-                {userExpanded
-                  ? i18n.t('收起内容')
-                  : i18n.t('展开全部（共 {{count}} 字）', { count: userContent.length })}
-              </button>
-            )}
-          </div>
-          {turn.user.attachments && turn.user.attachments.length > 0 && (
-            <div className="flex max-w-[94%] flex-wrap justify-end gap-1">
-              {turn.user.attachments.map(attachment => (
-                <span
-                  key={attachment.id}
-                  className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[9px] text-muted-foreground"
-                  title={attachment.path || attachment.name}
-                >
-                  {attachment.kind === 'image' && (attachment.thumbDataUrl || attachment.dataUrl) ? (
-                    <img src={attachment.thumbDataUrl || attachment.dataUrl} alt={attachment.name} className="h-5 w-5 shrink-0 rounded object-cover" />
-                  ) : attachment.source === 'repo' ? <AtSign className="h-2.5 w-2.5 shrink-0 text-primary" /> : <Paperclip className="h-2.5 w-2.5 shrink-0" />}
-                  <span className="truncate">{attachment.path || attachment.name}</span>
-                  <span className="shrink-0 opacity-70">{formatFileSize(attachment.size)}</span>
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="min-w-0 border-t border-border/60 pt-3">
-
-        {turn.assistants.length > 0 ? (
-          <div className="min-w-0 space-y-4">
-            {turn.assistants.map(message => (
-              <div key={message.id} className="min-w-0">
-                <AssistantTurn message={message} onOpenArtifact={onOpenArtifact} onApplyDiff={onApplyDiff} />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="flex items-center gap-2 py-1 text-[13px] text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            {i18n.t('思考中…')}
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
 function ApplyPatchDialog({
   request,
   repo,
@@ -663,7 +329,7 @@ function ApplyPatchDialog({
 
   return (
     <Dialog open={Boolean(request)} onOpenChange={open => { if (!open) onClose(); }}>
-      <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-xl">
+      <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <GitBranch className="h-4 w-4 text-primary" />
@@ -726,7 +392,7 @@ function ModelPickerDialog({
   const currentProvider = providers.find(item => item.type === currentType) || providers[0];
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-md">
+      <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <ModelAvatar modelDef={currentProvider} size="sm" />
@@ -744,7 +410,7 @@ function ModelPickerDialog({
             <div key={provider.type}>
               <div className="mb-1 flex items-center gap-1.5 px-1 text-[10px] text-muted-foreground">
                 <ModelAvatar modelDef={provider} size="sm" />
-                <span className="font-medium">{provider.label}</span>
+                <span className="font-medium">{modelDisplayName(provider.label)}</span>
                 {!loadProviderKey(provider.type) && provider.type !== currentType && <span>· {i18n.t('未配置 Key')}</span>}
               </div>
               <div className="space-y-1">
@@ -766,7 +432,7 @@ function ModelPickerDialog({
                       )}
                     >
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate font-medium">{model.label}</span>
+                        <span className="block truncate font-medium">{modelDisplayName(model.label)}</span>
                         <span className="block truncate font-mono text-[9px] text-muted-foreground">{model.value}</span>
                       </span>
                       {selected && <Check className="h-3.5 w-3.5 shrink-0" />}
@@ -834,7 +500,7 @@ function BranchPickerDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-md">
+      <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <GitBranch className="h-4 w-4 text-primary" />
@@ -993,7 +659,7 @@ function RepoFilePicker({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-xl">
+      <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <AtSign className="h-4 w-4 text-primary" />
@@ -1007,10 +673,10 @@ function RepoFilePicker({
             onChange={event => setQuery(event.target.value)}
             placeholder={i18n.t('搜索文件路径')}
             autoFocus
-            className="h-9 w-full rounded-lg border border-border bg-background pl-8 pr-3 text-sm outline-none focus:border-primary/50"
+            className="h-9 w-full min-w-0 rounded-lg border border-border bg-background pl-8 pr-3 text-sm outline-none focus:border-primary/50"
           />
         </div>
-        <div className="min-h-[180px] max-h-[50vh] overflow-y-auto rounded-lg border border-border">
+        <div className="min-h-[140px] max-h-[38dvh] overflow-y-auto rounded-lg border border-border md:max-h-[320px]">
           {loading ? (
             <div className="flex items-center justify-center gap-2 py-10 text-xs text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -1259,7 +925,7 @@ function ContextContent({
           <button
             type="button"
             onClick={onAddRepo}
-            className="flex w-full items-center gap-2 rounded-lg border border-dashed border-border px-3 py-3 text-left text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"
+            className="flex w-full items-center gap-2 rounded-lg border border-dashed border-border px-3 py-3 text-left text-xs text-muted-foreground hover:text-foreground"
           >
             <Plus className="h-4 w-4" />
             {i18n.t('选择仓库')}
@@ -1276,6 +942,13 @@ export default function AiAssistantV2Page() {
   const [sessions, setSessions] = useState<V2Session[]>([]);
   const [activeId, setActiveId] = useState('');
   const [input, setInput] = useState('');
+  const [editTargetId, setEditTargetId] = useState<string | null>(null);
+  const isAndroid = useMemo(
+    () => typeof window !== 'undefined' && !!(window as unknown as { AndroidBridge?: unknown }).AndroidBridge,
+    [],
+  );
+  // Android 由原生把 WebView 缩短来避让键盘，这里只给 Web 端兜底，避免双倍补偿
+  const keyboardInset = useKeyboardInset(!isAndroid);
   const [streaming, setStreaming] = useState(false);
   const [modelConfig] = useState<ModelConfig>(() => loadModelConfig());
   const [character, setCharacter] = useState<CharacterCard>(() => loadActiveCharacter(user?.login));
@@ -1308,16 +981,35 @@ export default function AiAssistantV2Page() {
   const streamFlushTimerRef = useRef<number | null>(null);
   const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const [viewportHeight, setViewportHeight] = useState(() => (
+    typeof window === 'undefined' ? 800 : window.innerHeight
+  ));
+  useEffect(() => {
+    let timer = 0;
+    const apply = () => {
+      const next = window.innerHeight;
+      setViewportHeight(prev => (Math.abs(prev - next) > 1 ? next : prev));
+    };
+    // 键盘弹出/收起是一段连续 resize，逐帧改高度会让整页反复重排（抖动）
+    const sync = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(apply, 120);
+    };
+    apply();
+    window.addEventListener('resize', sync);
+    window.visualViewport?.addEventListener('resize', sync);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('resize', sync);
+      window.visualViewport?.removeEventListener('resize', sync);
+    };
+  }, []);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const hydratedRef = useRef(false);
 
   const legacyKey = user?.login ? `${LEGACY_PREFIX}${user.login}` : '';
-  const isAndroid = useMemo(
-    () => typeof window !== 'undefined' && !!(window as unknown as { AndroidBridge?: unknown }).AndroidBridge,
-    [],
-  );
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeId) || sessions[0] || null,
     [sessions, activeId],
@@ -1350,7 +1042,7 @@ export default function AiAssistantV2Page() {
   );
   const modelLabel = useMemo(() => {
     const option = modelDef.models?.find(item => item.value === sessionModel);
-    return option?.label || sessionModel || modelDef.label;
+    return modelDisplayName(option?.label || sessionModel || modelDef.label);
   }, [modelDef, sessionModel]);
 
   useEffect(() => {
@@ -1475,13 +1167,23 @@ export default function AiAssistantV2Page() {
 
   const scrollToBottom = useCallback((force = false) => {
     if (!force && !stickToBottomRef.current) return;
-    requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ block: 'end' }));
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (!el) return;
+      // 用容器自身滚动，避免 scrollIntoView 顺手滚动外层 body
+      el.scrollTop = el.scrollHeight;
+    });
     setShowScrollButton(false);
   }, []);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages, streaming, scrollToBottom]);
+
+  // 键盘开合改变可视高度时，若原本贴底就继续保持贴底
+  useEffect(() => {
+    scrollToBottom();
+  }, [viewportHeight, scrollToBottom]);
 
   // 虚拟列表高度测量后补一次底部对齐，避免流式输出时被"截断"在中间
   const virtualTotalSize = virtualizer.getTotalSize();
@@ -1654,7 +1356,7 @@ export default function AiAssistantV2Page() {
       streamFlushTimerRef.current = window.setTimeout(() => {
         streamFlushTimerRef.current = null;
         flushStreamDelta();
-      }, 80);
+      }, STREAM_FLUSH_MS);
     }
   }, [flushStreamDelta]);
 
@@ -1887,9 +1589,9 @@ export default function AiAssistantV2Page() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const handleSend = async () => {
-    const text = input.trim();
-    const attachments = pendingAttachments;
+  const handleSend = async (options?: { text?: string; attachments?: UiAttachment[]; editTargetId?: string }) => {
+    const text = (options?.text ?? input).trim();
+    const attachments = options ? (options.attachments ?? []) : pendingAttachments;
     if ((!text && !attachments.length) || streaming) return;
     if (attachments.some(item => item.kind === 'image') && !modelCapabilities.supportsVision) {
       toast.error(i18n.t('当前模型不支持图片，请切换到视觉模型'));
@@ -1932,7 +1634,10 @@ export default function AiAssistantV2Page() {
       createdAt: now,
     };
 
-    const historyMessages = await hydrateMessageImages(messages);
+    const targetId = options?.editTargetId ?? editTargetId ?? undefined;
+    const targetIndex = targetId ? messages.findIndex(message => message.id === targetId) : -1;
+    const baseMessages = targetIndex >= 0 ? messages.slice(0, targetIndex) : messages;
+    const historyMessages = await hydrateMessageImages(baseMessages);
     const previousHistory = toAgentHistory(historyMessages.map(message => ({
       role: message.role,
       content: message.content,
@@ -1947,9 +1652,10 @@ export default function AiAssistantV2Page() {
       sessionId: activeSession?.id,
       title: text || `${i18n.t('附件')} ${attachments[0]?.name || ''}`,
     });
-    setMessages(prev => [...prev, userMessage, assistantMessage]);
+    setMessages([...baseMessages, userMessage, assistantMessage]);
     setInput('');
     setPendingAttachments([]);
+    setEditTargetId(null);
     setStreaming(true);
     stickToBottomRef.current = true;
 
@@ -1989,7 +1695,8 @@ export default function AiAssistantV2Page() {
         let message = (error as Error)?.message || String(error);
 
         // OpenRouter 免费额度用尽：无仓库上下文时自动切到 Cloudflare Workers AI 免费额度。
-        if (isOpenRouterDailyLimit(message) && modelConfig.type === 'openrouter' && !repoContext) {
+        const fallbackProxy = modelConfig.proxy_url?.trim().replace(/\/+$/, '') || '';
+        if (isOpenRouterDailyLimit(message) && modelConfig.type === 'openrouter' && !repoContext && fallbackProxy) {
           toast.info(i18n.t('OpenRouter 免费额度已用尽，正在切换 Cloudflare AI 重试'));
           patchAssistant(assistantId, {
             content: `> ${i18n.t('OpenRouter 免费额度已用尽，已切换到 Cloudflare AI 重试。')}\n\n`,
@@ -2004,7 +1711,7 @@ export default function AiAssistantV2Page() {
               token,
               userLogin: user?.login,
               runId,
-              config: CLOUDFLARE_FALLBACK_CONFIG,
+              config: { ...CLOUDFLARE_FALLBACK_CONFIG, proxy_url: fallbackProxy },
               history,
               currentUserContent: modelContent,
               currentUserText: userText,
@@ -2056,6 +1763,20 @@ export default function AiAssistantV2Page() {
     }
   };
 
+  const handleEditUser = (message: UiChatMessage) => {
+    if (streaming) return;
+    setInput(message.content);
+    setPendingAttachments(message.attachments || []);
+    setEditTargetId(message.id);
+  };
+  const handleRegenerate = (userMessage: UiChatMessage) => {
+    if (streaming) return;
+    void handleSend({
+      text: userMessage.content,
+      attachments: userMessage.attachments,
+      editTargetId: userMessage.id,
+    });
+  };
   const handleResume = async () => {
     const snapshot = resumableSnapshot;
     if (!snapshot || streaming || !token) return;
@@ -2131,6 +1852,11 @@ export default function AiAssistantV2Page() {
 
   const handleStop = () => {
     flushStreamDelta();
+    pendingStreamRef.current = null;
+    if (streamFlushTimerRef.current !== null) {
+      window.clearTimeout(streamFlushTimerRef.current);
+      streamFlushTimerRef.current = null;
+    }
     approvalResolverRef.current?.(false);
     approvalResolverRef.current = null;
     setApprovalRequest(null);
@@ -2213,11 +1939,16 @@ export default function AiAssistantV2Page() {
     toast.success(i18n.t('对话已重命名'));
   };
 
-  const handleDeleteSession = (id: string) => {
+  const handleDeleteSession = async (id: string) => {
     if (streaming) return;
     const target = sessions.find(session => session.id === id);
     if (!target) return;
-    if (!window.confirm(i18n.t('确定删除对话「{{title}}」？此操作不可恢复。', { title: target.title || i18n.t('新对话') }))) return;
+    const confirmed = await confirmAction({
+      title: i18n.t('删除这段对话？'),
+      description: i18n.t('「{{title}}」及其消息将被永久删除，无法恢复。', { title: target.title || i18n.t('新对话') }),
+      confirmText: i18n.t('删除'),
+    });
+    if (!confirmed) return;
     if (user?.login) void clearRunSnapshots(user.login, id);
     if (user?.login) void deleteSessionMessages(user.login, id);
     loadedSessionsRef.current.delete(id);
@@ -2249,9 +1980,16 @@ export default function AiAssistantV2Page() {
     }
   };
 
-  const handleClear = () => {
+  const handleClear = async () => {
     if (streaming) return;
-    if (hasConversation && !window.confirm(i18n.t('确定清空当前对话？'))) return;
+    if (hasConversation) {
+      const confirmed = await confirmAction({
+        title: i18n.t('清空当前对话？'),
+        description: i18n.t('当前对话的所有消息都会被删除，无法恢复。'),
+        confirmText: i18n.t('清空'),
+      });
+      if (!confirmed) return;
+    }
     setMessages([]);
     setInput('');
     setPendingAttachments([]);
@@ -2283,8 +2021,8 @@ export default function AiAssistantV2Page() {
 
   return (
     <div
-      className="flex min-h-0 w-full overflow-hidden bg-background"
-      style={{ height: `calc(100dvh - ${isAndroid ? 56 : 120}px)` }}
+      className="flex min-h-0 w-full min-w-0 overflow-hidden bg-background"
+      style={{ height: `${Math.max(240, viewportHeight - (isAndroid ? 56 : 120))}px` }}
     >
       {/* 桌面端会话侧栏 */}
       <aside className="hidden w-56 shrink-0 flex-col border-r border-border bg-muted/10 2xl:flex">
@@ -2405,9 +2143,9 @@ export default function AiAssistantV2Page() {
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain"
+          className="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain [overflow-anchor:none]"
         >
-          <div className="mx-auto w-full max-w-3xl px-3 py-4 sm:px-5">
+          <div className="mx-auto w-full max-w-3xl px-3.5 py-4 sm:px-6">
             {sessionLoading ? (
               <div className="flex min-h-[28vh] items-center justify-center gap-2 text-xs text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -2422,7 +2160,7 @@ export default function AiAssistantV2Page() {
                       key={prompt.label}
                       type="button"
                       onClick={() => setInput(prompt.text)}
-                      className="rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                      className="rounded-full border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
                     >
                       {prompt.label}
                     </button>
@@ -2436,7 +2174,7 @@ export default function AiAssistantV2Page() {
                 if (!virtualItems.length) {
                   const recent = turns.slice(-12);
                   return (
-                    <div className="space-y-5">
+                    <div className="space-y-6">
                       {recent.map((turn, index) => (
                         <ConversationTurnView
                           key={turn.id}
@@ -2444,6 +2182,9 @@ export default function AiAssistantV2Page() {
                           index={turns.length - recent.length + index}
                           onOpenArtifact={openArtifact}
                           onApplyDiff={handleApplyDiff}
+                          onEditUser={handleEditUser}
+                          onRegenerate={handleRegenerate}
+                          regenerateId={messages[messages.length - 1]?.role === 'assistant' ? messages[messages.length - 1]?.id : undefined}
                         />
                       ))}
                     </div>
@@ -2459,7 +2200,7 @@ export default function AiAssistantV2Page() {
                           key={turn.id}
                           data-index={item.index}
                           ref={virtualizer.measureElement}
-                          className="absolute left-0 top-0 w-full pb-5"
+                          className="absolute left-0 top-0 w-full pb-6"
                           style={{ transform: `translateY(${item.start}px)` }}
                         >
                           <ConversationTurnView
@@ -2467,6 +2208,9 @@ export default function AiAssistantV2Page() {
                             index={item.index}
                             onOpenArtifact={openArtifact}
                             onApplyDiff={handleApplyDiff}
+                            onEditUser={handleEditUser}
+                            onRegenerate={handleRegenerate}
+                            regenerateId={messages[messages.length - 1]?.role === 'assistant' ? messages[messages.length - 1]?.id : undefined}
                           />
                         </div>
                       );
@@ -2490,9 +2234,13 @@ export default function AiAssistantV2Page() {
           )}
         </div>
 
-        <div className="shrink-0 border-t border-border bg-background/95 px-2 pb-2 pt-2 sm:px-3">
-          <div className="mx-auto w-full max-w-3xl">
-            <div className="rounded-2xl border border-border bg-card p-2 shadow-sm transition-colors focus-within:border-primary/40">
+        <div
+          className="w-full min-w-0 shrink-0 border-t border-border bg-background/95 px-2 pt-2 sm:px-3"
+          // 键盘弹出时整条输入区上移，避免被输入法遮住（pb 由 style 动态给出）
+          style={{ paddingBottom: keyboardInset > 0 ? keyboardInset + 8 : 8 }}
+        >
+          <div className="mx-auto w-full min-w-0 max-w-3xl">
+            <div className="rounded-[22px] border border-border/80 bg-card p-2 shadow-sm transition-colors">
               <div className="mb-1 flex flex-wrap items-center gap-1.5 px-1">
                 {repoContext ? (
                   <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-primary/20 bg-primary/5 px-2 py-0.5 text-[10px] text-primary">
@@ -2508,7 +2256,7 @@ export default function AiAssistantV2Page() {
                   <button
                     type="button"
                     onClick={() => setRepoDialogOpen(true)}
-                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
                   >
                     <Plus className="h-3 w-3" />
                     {i18n.t('选择仓库')}
@@ -2563,7 +2311,7 @@ export default function AiAssistantV2Page() {
                 placeholder={i18n.t('输入消息… Enter 发送，Shift+Enter 换行')}
                 rows={1}
                 disabled={streaming}
-                className="max-h-44 min-h-[40px] resize-none border-0 bg-transparent px-2 py-1.5 text-sm shadow-none focus-visible:ring-0"
+                className="max-h-44 min-h-[42px] resize-none border-0 bg-transparent px-2.5 py-2 text-sm shadow-none outline-none focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
               />
 
               <div className="flex items-center gap-1 px-1 pt-1">
@@ -2598,7 +2346,7 @@ export default function AiAssistantV2Page() {
                 <button
                   type="button"
                   onClick={() => setModelDialogOpen(true)}
-                  className="flex min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className="flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
                 >
                   <ModelAvatar modelDef={modelDef} size="sm" />
                   <span className="max-w-[110px] truncate">{modelLabel}</span>
@@ -2607,8 +2355,8 @@ export default function AiAssistantV2Page() {
                 <Button
                   type="button"
                   size="icon"
-                  className="h-8 w-8 shrink-0 rounded-lg ml-auto"
-                  onClick={streaming ? handleStop : handleSend}
+                  className="ml-auto h-9 w-9 shrink-0 rounded-full"
+                  onClick={streaming ? handleStop : () => { void handleSend(); }}
                   disabled={!streaming && ((!input.trim() && pendingAttachments.length === 0) || !token)}
                   title={streaming ? i18n.t('停止生成') : i18n.t('发送')}
                 >
@@ -2643,7 +2391,7 @@ export default function AiAssistantV2Page() {
           if (!open) resolveApproval(false);
         }}
       >
-        <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-lg">
+        <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-base">
               <ShieldAlert className="h-4 w-4 text-amber-500" />
@@ -2726,7 +2474,7 @@ const args = approvalRequest.arguments as Record<string, unknown>;
       </Dialog>
 
       <Dialog open={artifactDialogOpen} onOpenChange={setArtifactDialogOpen}>
-        <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-2xl">
+        <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-2xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-base">
               <FileText className="h-4 w-4 text-primary" />
@@ -2759,7 +2507,7 @@ const args = approvalRequest.arguments as Record<string, unknown>;
       </Dialog>
 
       <Dialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen}>
-        <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-xl">
+        <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-xl">
           <DialogHeader>
             <DialogTitle className="text-base">{i18n.t('选择仓库')}</DialogTitle>
           </DialogHeader>
@@ -2820,7 +2568,7 @@ const args = approvalRequest.arguments as Record<string, unknown>;
 
       <Sheet open={sessionDialogOpen} onOpenChange={setSessionDialogOpen}>
         <SheetContent side="left" className="flex w-[86vw] max-w-sm flex-col gap-0 p-0">
-          <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-3 pr-9">
+          <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border px-3 pr-14">
             <SheetTitle className="text-sm font-semibold">{i18n.t('对话历史')}</SheetTitle>
             <Button type="button" size="sm" className="h-7 gap-1 px-2 text-xs" onClick={handleNewSession} disabled={streaming}>
               <Plus className="h-3.5 w-3.5" />
@@ -2841,7 +2589,7 @@ const args = approvalRequest.arguments as Record<string, unknown>;
       </Sheet>
 
       <Dialog open={contextDialogOpen} onOpenChange={setContextDialogOpen}>
-        <DialogContent className="max-w-[calc(100%-2rem)] p-4 md:max-w-sm">
+        <DialogContent className="max-h-[85dvh] max-w-[calc(100%-2rem)] overflow-y-auto p-4 md:max-w-sm">
           <DialogHeader>
             <DialogTitle className="text-base">{i18n.t('会话上下文')}</DialogTitle>
           </DialogHeader>

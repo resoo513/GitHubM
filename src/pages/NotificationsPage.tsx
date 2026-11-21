@@ -28,6 +28,7 @@ import {
 import type { GitHubNotification } from '@/types/types';
 import { toast } from 'sonner';
 import { pageCache } from '@/lib/page-cache';
+import { publishNotificationUnread } from '@/lib/notificationBadge';
 import i18n from "@/i18n";
 
 export default function NotificationsPage() {
@@ -37,6 +38,10 @@ export default function NotificationsPage() {
   const [showAll, setShowAll] = useState(false);
   const [markingAll, setMarkingAll] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!loading) publishNotificationUnread(notifications.some((item) => item.unread));
+  }, [notifications, loading]);
 
   const loadNotifications = useCallback(async (force = false) => {
     const cacheKey = `notifications:${showAll}`;
@@ -113,15 +118,19 @@ export default function NotificationsPage() {
   /** 点击通知：自动标为已读并跳转到对应页面 */
   const handleNotificationClick = async (notification: GitHubNotification) => {
     if (notification.unread) {
-      // 乐观更新 UI，再执行 API 调用
-      setNotifications((prev) =>
-        prev.map((n) => (n.id === notification.id ? { ...n, unread: false } : n))
-      );
+      const cacheKey = `notifications:${showAll}`;
+      // 乐观更新 UI，同时写回列表缓存，避免返回时又显示未读。
+      setNotifications((prev) => {
+        const updated = prev.map((n) => (n.id === notification.id ? { ...n, unread: false } : n));
+        pageCache.set(cacheKey, updated, 2 * 60 * 1000);
+        return updated;
+      });
       markNotificationRead(notification.id).catch(() => {
-        // 回滚
-        setNotifications((prev) =>
-          prev.map((n) => (n.id === notification.id ? { ...n, unread: true } : n))
-        );
+        setNotifications((prev) => {
+          const rollback = prev.map((n) => (n.id === notification.id ? { ...n, unread: true } : n));
+          pageCache.set(cacheKey, rollback, 2 * 60 * 1000);
+          return rollback;
+        });
       });
     }
     const route = resolveNotificationRoute(notification);
@@ -257,18 +266,18 @@ export default function NotificationsPage() {
       </div>
 
       {/* 通知列表 */}
-      <div className="bg-card border border-border rounded-lg overflow-hidden">
+      <div className="space-y-2">
         {loading ? (
-          <div className="divide-y divide-border">
+          <div className="space-y-2">
             {[1, 2, 3, 4, 5].map((i) => (
-              <div key={i} className="p-4">
+              <div key={i} className="bg-card border border-border rounded-xl p-4">
                 <Skeleton className="h-5 w-3/4 bg-muted mb-2" />
                 <Skeleton className="h-4 w-1/3 bg-muted" />
               </div>
             ))}
           </div>
         ) : notifications.length === 0 ? (
-          <div className="py-16 text-center">
+          <div className="bg-card border border-border rounded-xl py-16 text-center">
             <BellOff className="w-12 h-12 text-muted-foreground mx-auto mb-3" />
             <p className="text-foreground font-medium">{i18n.t('暂无通知')}</p>
             <p className="text-muted-foreground text-sm mt-1">
@@ -276,53 +285,50 @@ export default function NotificationsPage() {
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-border">
+          <div className="space-y-2">
             {notifications.map((notification) => (
               <div
                 key={notification.id}
-                className={`p-4 transition-colors cursor-pointer ${notification.unread ? 'bg-primary/5 hover:bg-primary/10' : 'hover:bg-secondary/50'}`}
-                onClick={() => handleNotificationClick(notification)}
+                className={`bg-card border border-border rounded-xl overflow-hidden`}
               >
-                <div className="flex items-start gap-3">
-                  {/* 未读指示点 */}
-                  <div className="mt-1.5 shrink-0">
-                    {notification.unread ? (
-                      <div className="w-2 h-2 rounded-full bg-primary" />
-                    ) : (
-                      <div className="w-2 h-2 rounded-full bg-transparent border border-muted-foreground/30" />
-                    )}
-                  </div>
-                  {/* 类型图标 */}
-                  <div className="mt-0.5 shrink-0">
-                    {getNotificationIcon(notification.subject.type)}
-                  </div>
-                  {/* 通知内容 */}
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-sm text-balance ${notification.unread ? 'text-foreground font-medium' : 'text-muted-foreground'}`}>
-                      {notification.subject.title}
-                    </p>
-                    <div className="flex items-center gap-2 mt-1 flex-wrap">
-                      <span className="text-xs text-muted-foreground">
-                        {notification.repository.full_name}
-                      </span>
-                      <Badge variant="outline" className="text-xs h-4 px-1 border-border text-muted-foreground">
-                        {getTypeLabel(notification.subject.type)}
-                      </Badge>
-                      <span className="text-xs text-muted-foreground">
-                        {formatRelativeTime(notification.updated_at)}
-                      </span>
+                <button
+                  type="button"
+                  className={`w-full text-left px-4 py-3 transition-colors ${notification.unread ? 'bg-primary/[0.03] hover:bg-primary/[0.06]' : 'hover:bg-secondary/50'}`}
+                  onClick={() => handleNotificationClick(notification)}
+                >
+                  <div className="flex items-start gap-3">
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${notification.unread ? 'bg-primary/10' : 'bg-secondary/60'}`}>
+                      {getNotificationIcon(notification.subject.type)}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-start gap-2">
+                        {notification.unread && <span className="mt-1.5 w-2 h-2 rounded-full bg-primary shrink-0" />}
+                        <p className="text-sm font-semibold text-foreground text-balance">
+                          {notification.subject.title}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 mt-1.5 flex-wrap text-xs text-muted-foreground">
+                        <span>{notification.repository.full_name}</span>
+                        <span>·</span>
+                        <span>{formatRelativeTime(notification.updated_at)}</span>
+                      </div>
                     </div>
                   </div>
-                  {/* 操作 */}
-                  <div className="shrink-0 flex items-center gap-0.5">
+                </button>
+                <div className={`flex items-center justify-between gap-2 px-3 py-2 border-t border-border ${notification.unread ? 'bg-primary/5' : 'bg-secondary/20'}`}>
+                  <Badge variant="outline" className="text-xs h-5 px-1.5 border-border text-muted-foreground">
+                    {getTypeLabel(notification.subject.type)}
+                  </Badge>
+                  <div className="flex items-center gap-0.5">
                     {notification.unread && (
                       <Button
                         variant="ghost"
                         size="sm"
                         className="text-muted-foreground hover:bg-secondary h-7 text-xs"
-                        onClick={(e) => { e.stopPropagation(); handleMarkRead(notification.id); }}
+                        onClick={() => handleMarkRead(notification.id)}
                       >
-                        {i18n.t('标为已读')}</Button>
+                        {i18n.t('标为已读')}
+                      </Button>
                     )}
                     <Button
                       variant="ghost"
@@ -330,10 +336,7 @@ export default function NotificationsPage() {
                       className="w-7 h-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                       title={i18n.t('删除通知')}
                       disabled={deletingId === notification.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void handleDeleteNotification(notification);
-                      }}
+                      onClick={() => void handleDeleteNotification(notification)}
                     >
                       {deletingId === notification.id
                         ? <Loader2 className="w-3.5 h-3.5 animate-spin" />

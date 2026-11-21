@@ -1,4 +1,5 @@
 // AI Assistant V2 — OpenAI 兼容 Provider 层
+import { normalizeChatEndpoint } from '@/lib/ai-endpoint';
 import type { ModelConfig } from '@/components/ai/aiTypes';
 import { getModelCapabilities } from './modelCapabilities';
 import type {
@@ -8,8 +9,6 @@ import type {
   V2ToolCall,
   V2ToolDefinition,
 } from './types';
-
-const DEFAULT_PROXY = 'https://llm.callact.xyz';
 
 export function getProviderEndpoint(config: ModelConfig): string {
   switch (config.type) {
@@ -24,7 +23,7 @@ export function getProviderEndpoint(config: ModelConfig): string {
     case 'openrouter':
       return 'https://openrouter.ai/api/v1/chat/completions';
     case 'custom':
-      return config.endpoint?.trim() || '';
+      return normalizeChatEndpoint(config.endpoint);
     default:
       return '';
   }
@@ -33,11 +32,16 @@ export function getProviderEndpoint(config: ModelConfig): string {
 function getRequestUrl(config: ModelConfig): { url: string; proxy: boolean } {
   const explicitProxy = config.proxy_url?.trim().replace(/\/+$/, '');
   if (explicitProxy) return { url: `${explicitProxy}/v1/chat/completions`, proxy: true };
-  // OpenRouter / 自定义接口支持浏览器 CORS，默认直连；其余走项目内置无状态代理。
-  if (config.type === 'openrouter' || config.type === 'custom') {
-    return { url: getProviderEndpoint(config), proxy: false };
+  // 默认直连模型官方接口：API Key 不经过任何第三方。
+  // 只有用户在设置里显式填写代理地址时才走代理。
+  const endpoint = getProviderEndpoint(config);
+  if (!endpoint) {
+    if (config.type === 'cloudflare') {
+      throw new Error('Cloudflare 免费通道需要先填写代理地址');
+    }
+    throw new Error('请先在模型设置中填写接口地址');
   }
-  return { url: `${DEFAULT_PROXY}/v1/chat/completions`, proxy: true };
+  return { url: endpoint, proxy: false };
 }
 
 /** 部分供应商（DeepSeek）禁止回传 reasoning_content，发送前统一剔除 */
@@ -47,6 +51,52 @@ export function stripReasoningContent(messages: V2ProviderMessage[]): V2Provider
     const { reasoning_content: _reasoning, ...rest } = message;
     return rest;
   });
+}
+
+/**
+ * 发送前修复 tool_calls 与 tool 结果的配对关系。
+ *
+ * 供应商（OpenAI / DeepSeek 等）对消息序列有硬约束，违反会直接返回 HTTP 400：
+ *   - `insufficient tool messages following tool_calls`：assistant 声明了调用，
+ *     但紧随其后的不是对应的 tool 结果；
+ *   - `tool message without preceding tool_calls`：tool 结果找不到来源。
+ *
+ * 上下文压缩（截断 / 拼接 / 丢弃旧回合）会把原本配对的 assistant 与 tool 拆散，
+ * 且断点可能落在序列任意位置而非仅末尾，因此这里做位置无关的清理：
+ *   1. 移除 tool_calls 没有紧邻完整回复的 assistant 消息；
+ *   2. 移除孤立的 tool 消息（沿连续 tool 链回溯找来源）。
+ */
+export function sanitizeToolCallPairing(messages: V2ProviderMessage[]): V2ProviderMessage[] {
+  if (messages.length === 0) return [];
+  const result = [...messages];
+
+  // 1. 从后往前移除缺少紧邻 tool 回复的 assistant(tool_calls)。
+  for (let index = result.length - 1; index >= 0; index--) {
+    const message = result[index];
+    const calls = message.role === 'assistant' ? message.tool_calls : undefined;
+    if (!Array.isArray(calls) || calls.length === 0) continue;
+    const paired = calls.every((call, offset) => {
+      const next = result[index + 1 + offset];
+      return Boolean(next) && next.role === 'tool' && next.tool_call_id === call.id;
+    });
+    if (!paired) result.splice(index, 1);
+  }
+
+  // 2. 移除孤立的 tool 消息：沿连续 tool 链回溯，源头必须是声明的 assistant。
+  for (let index = result.length - 1; index >= 0; index--) {
+    const message = result[index];
+    if (message.role !== 'tool' || !message.tool_call_id) continue;
+    let cursor = index - 1;
+    while (cursor >= 0 && result[cursor].role === 'tool') cursor -= 1;
+    const source = cursor >= 0 ? result[cursor] : undefined;
+    const sourced =
+      source?.role === 'assistant' &&
+      Array.isArray(source.tool_calls) &&
+      source.tool_calls.some(call => call.id === message.tool_call_id);
+    if (!sourced) result.splice(index, 1);
+  }
+
+  return result;
 }
 
 export function buildProviderRequest(
@@ -73,7 +123,7 @@ export function buildProviderRequest(
 
   const body: Record<string, unknown> = {
     model: config.model || defaultModelFor(config.type),
-    messages: stripReasoningContent(messages),
+    messages: sanitizeToolCallPairing(stripReasoningContent(messages)),
     stream: true,
     max_tokens: getModelCapabilities(config.type, config.model).maxOutput,
   };
@@ -127,10 +177,18 @@ export async function streamProvider(
   const onAbort = () => requestController.abort();
   if (signal.aborted) requestController.abort();
   else signal.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    requestController.abort();
-  }, timeoutMs);
+  // 空闲超时：每收到一块数据就重新计时。
+  // 这样长时间 reasoning 的模型不会因为「总时长」被硬切，
+  // 上游真正挂住不发包时仍能在 timeoutMs 内失败。
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const armTimeout = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      requestController.abort();
+    }, timeoutMs);
+  };
+  armTimeout();
 
   try {
   const prepared = buildProviderRequest(config, messages, tools);
@@ -223,6 +281,7 @@ export async function streamProvider(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      armTimeout();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || '';
@@ -263,7 +322,7 @@ export async function streamProvider(
     }
     throw error;
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     signal.removeEventListener('abort', onAbort);
   }
 }

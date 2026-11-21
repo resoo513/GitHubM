@@ -57,6 +57,12 @@
     --info-foreground: 0 0% 100%;
     --code-bg: 220 14% 96%;
     --code-border: 0 0% 91%;
+    /* 引用块（blockquote）：用中性灰底色分层，不用彩色也不用边框，
+       靠底色明度差区分「这是被引用的原文」，避免抢正文注意力。 */
+    --quote-bg: 220 9% 95%;
+    /* 登录页：卡片阴影（浅色，做了淡化） */
+    --login-card-shadow: 6px 6px 14px rgba(163, 177, 198, 0.30), -6px -6px 14px rgba(255, 255, 255, 0.90);
+    --login-cta-shadow: 0 10px 20px -14px rgba(22, 119, 255, 0.60);
   }
 
   /* 深色模式 */
@@ -106,6 +112,12 @@
     --info-foreground: 0 0% 100%;
     --code-bg: 0 0% 9%;
     --code-border: 0 0% 20%;
+    /* 引用块（blockquote）：深色下走中性灰，但要比卡片(card 12%)明显浅一档，
+     深色屏幕里「更深」几乎看不出差别，必须往上提亮度才能分辨。 */
+    --quote-bg: 0 0% 19%;
+    /* 登录页：卡片阴影（深色，做了淡化） */
+    --login-card-shadow: 4px 4px 12px rgba(0, 0, 0, 0.40), -4px -4px 12px rgba(255, 255, 255, 0.025);
+    --login-cta-shadow: 0 10px 20px -14px rgba(22, 119, 255, 0.45);
   }
 }
 
@@ -232,6 +244,21 @@
 
   .surface-elevated {
     box-shadow: var(--shadow-soft-md);
+  }
+
+  /*
+   * 顶栏图标按钮：浅色主题下点击/悬停保持深色图标，深色主题才使用白色。
+   * 避免 ghost 变体的 hover:text-accent-foreground 在浅色主题把图标刷成白色。
+   */
+  .topbar-icon:hover,
+  .topbar-icon:active {
+    background-color: hsl(var(--secondary)) !important;
+    color: hsl(var(--foreground)) !important;
+  }
+
+  .dark .topbar-icon:hover,
+  .dark .topbar-icon:active {
+    color: #fff !important;
   }
 
   [class~='bg-card'][class~='border-border'] {
@@ -372,9 +399,11 @@
     margin-bottom: 0.25rem;
   }
 
+  /* 引用块（被引用的原文）：靠底色明度差与正文区分，不用彩色、不用边框线 */
   .markdown-body blockquote {
-    border-left: 4px solid hsl(var(--border));
-    padding-left: 1rem;
+    background: hsl(var(--quote-bg));
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
     color: hsl(var(--muted-foreground));
     margin: 1rem 0;
   }
@@ -413,6 +442,83 @@
     border: none;
     border-top: 1px solid hsl(var(--border));
     margin: 1.5rem 0;
+  }
+
+  /*
+   * 紧凑版 Markdown：用于更新弹窗、商店详情页发布说明等「小字号摘要」场景。
+   * README 那套排版按正文阅读设计（h2 = 1.25rem、段间距 1rem、标题上留 1.5rem），
+   * 直接塞进 12px 的弹窗窄框里会显得又大又空，所以这里整体降到正文级字号。
+   */
+  .markdown-compact {
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .markdown-compact > :first-child {
+    margin-top: 0;
+  }
+  .markdown-compact > :last-child {
+    margin-bottom: 0;
+  }
+  .markdown-compact h1,
+  .markdown-compact h2,
+  .markdown-compact h3,
+  .markdown-compact h4,
+  .markdown-compact h5,
+  .markdown-compact h6 {
+    font-size: 12px;
+    font-weight: 600;
+    margin: 12px 0 4px;
+    padding: 0;
+    border: none;
+    line-height: 1.5;
+  }
+  .markdown-compact p {
+    margin: 0 0 8px;
+  }
+  .markdown-compact ul,
+  .markdown-compact ol {
+    padding-left: 16px;
+    margin: 0 0 8px;
+  }
+  .markdown-compact li {
+    margin-bottom: 2px;
+  }
+  /* 任务列表（- [x]）由 remark-gfm 渲染，去掉默认圆点，避免和方框重复 */
+  .markdown-compact li:has(> input[type='checkbox']) {
+    list-style: none;
+    margin-left: -16px;
+  }
+    /* 紧凑场景（列表预览等）：同步用底色区分，内边距收窄 */
+  .markdown-compact blockquote {
+    background: hsl(var(--quote-bg));
+    margin: 8px 0;
+    padding: 6px 8px;
+    border-radius: 6px;
+  }
+  .markdown-compact pre {
+    padding: 8px;
+    margin-bottom: 8px;
+    font-size: 11px;
+  }
+  .markdown-compact pre code {
+    font-size: 11px;
+  }
+  .markdown-compact code {
+    font-size: 11px;
+  }
+  .markdown-compact table {
+    font-size: 11px;
+    margin-bottom: 8px;
+  }
+  .markdown-compact th,
+  .markdown-compact td {
+    padding: 4px 8px;
+  }
+  .markdown-compact hr {
+    margin: 12px 0;
+  }
+  .markdown-compact img {
+    margin: 4px 0;
   }
 }
 
@@ -466,4 +572,58 @@ html.theme-transitioning *::after {
     font-size: 14px !important;
     line-height: 24px !important;
   }
+}
+/* ── 登录页：轻拟态卡片 + 下划线输入 ─────────────────────────────── */
+.login-page {
+  background: hsl(var(--background));
+}
+
+.login-card {
+  background: hsl(var(--background));
+  border: 0;
+  border-radius: 22px;
+  padding: 22px 20px 20px;
+  box-shadow: var(--login-card-shadow);
+}
+
+.login-card .login-underline {
+  border: 0 !important;
+  border-bottom: 2px solid hsl(var(--foreground)) !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding-left: 32px !important;
+  padding-right: 32px !important;
+  text-align: center !important;
+  caret-color: #1677FF !important;
+}
+
+.login-card .login-underline:focus,
+.login-card .login-underline:focus-visible {
+  border-bottom: 2px solid hsl(var(--foreground)) !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.login-cta {
+  background: #1677FF;
+  color: #fff;
+  border: 0;
+  border-radius: 12px;
+  box-shadow: var(--login-cta-shadow);
+  transition: transform 0.12s ease, filter 0.18s ease;
+}
+
+.login-cta:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+.login-cta:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* AI 对话：等待与流式指示点 */
+@keyframes fading {
+  0%, 100% { opacity: 0.3; }
+  33%, 66% { opacity: 1; }
 }

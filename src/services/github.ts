@@ -26,359 +26,26 @@ import type {
   SortDirection,
 } from '@/types/types';
 import i18n from "@/i18n";
-
-const BASE_URL = 'https://api.github.com';
-
-let authToken: string | null = null;
-
-// ── TTL 请求缓存层 ──────────────────────────────────────────────────
-// 替代原 addCacheBuster 时间戳反模式：
-//   - addCacheBuster 每次 GET 追加 _t=Date.now()，完全禁用 HTTP 缓存，
-//     导致相同接口被重复请求，加速 GitHub API Rate Limit（60次/小时 未认证，
-//     5000次/小时 已认证）耗尽。
-//   - 改为内存 TTL 缓存：GET 响应缓存 30s（用户列表/仓库详情等低频变化数据），
-//     同一 URL + token 组合在 TTL 内直接返回缓存，超时后重新请求。
-//   - 写操作（POST/PUT/PATCH/DELETE）始终跳过缓存，并自动失效相关前缀缓存。
-interface CacheEntry<T> {
-  data: T;
-  expireAt: number; // ms 时间戳
-}
-const apiCache = new Map<string, CacheEntry<unknown>>();
-const CACHE_TTL_MS = 30_000; // 30s
-
-/**
- * 需要打时间戳绕过 GitHub CDN 强制缓存（60s）的 URL 前缀集合。
- * 写操作后由 invalidateCacheForMutation 填充，下次对应 GET 发出时消费并附加 _t=Date.now()。
- */
-const cdnBustPrefixes = new Set<string>();
-
-/** 生成缓存 key（URL + 当前 token，token 变化后旧缓存自动失效） */
-export function buildCacheKey(url: string): string {
-  return `${authToken ?? ''}|${url}`;
-}
-
-/** 读取缓存，过期自动删除并返回 null */
-export function getCached<T>(key: string): T | null {
-  const entry = apiCache.get(key) as CacheEntry<T> | undefined;
-  if (!entry) return null;
-  if (Date.now() > entry.expireAt) {
-    apiCache.delete(key);
-    return null;
-  }
-  return entry.data;
-}
-
-/** 写入缓存 */
-export function setCached<T>(key: string, data: T): void {
-  apiCache.set(key, { data, expireAt: Date.now() + CACHE_TTL_MS });
-}
-
-/** 主动失效包含指定前缀的所有缓存（写操作后调用） */
-export function invalidateCache(urlPrefix: string): void {
-  for (const key of apiCache.keys()) {
-    if (key.includes(urlPrefix)) apiCache.delete(key);
-  }
-}
-
-/**
- * 失效内存缓存并同时标记该前缀需要 CDN 绕过。
- * 下次对该前缀的 GET 请求会自动附加时间戳参数，迫使 GitHub CDN 返回最新数据。
- */
-function invalidateAndBust(urlPrefix: string): void {
-  invalidateCache(urlPrefix);
-  cdnBustPrefixes.add(urlPrefix);
-}
-
-/**
- * 检查并消费 CDN 绕过标记：若 url 命中任意已标记前缀，
- * 返回附加了 _t=Date.now() 的新 URL，并移除该前缀标记；否则返回原 URL。
- */
-function consumeCacheBust(url: string): string {
-  for (const prefix of cdnBustPrefixes) {
-    if (url.includes(prefix)) {
-      cdnBustPrefixes.delete(prefix);
-      const sep = url.includes('?') ? '&' : '?';
-      return `${url}${sep}_t=${Date.now()}`;
-    }
-  }
-  return url;
-}
-
-/** 清空全部缓存（退出登录时调用） */
-export function clearApiCache(): void {
-  apiCache.clear();
-  cdnBustPrefixes.clear();
-}
-
-/**
- * 写操作后的智能级联缓存失效。
- * 除了失效操作 URL 本身，还按 URL 模式推导并失效所有相关列表/父目录缓存。
- * 对于需要绕过 GitHub CDN 强制缓存（60s）的关键场景，同时调用 invalidateAndBust
- * 在下次 GET 时附加时间戳参数，确保拿到最新数据。
- *
- * 覆盖场景：
- *   - 仓库 CRUD → 失效 /user/repos、/users/:owner/repos
- *   - 文件写/删 → 失效 /repos/:owner/:repo/contents（所有层级）
- *   - 分支创建/删除 → 失效 /repos/:owner/:repo/branches + /git/refs
- *   - Issue 写操作 → 失效 /repos/:owner/:repo/issues 列表
- *   - PR 写操作   → 失效 /repos/:owner/:repo/pulls + issues 列表
- *   - 评论写操作  → 失效对应 issue/PR 的评论列表
- *   - 协作者变更  → 失效 /repos/:owner/:repo/collaborators
- *   - Gist 写操作 → 失效 /gists 列表
- *   - Star/Unstar → 失效 /user/starred + checkStarred 缓存
- */
-function invalidateCacheForMutation(url: string, method: string): void {
-  const path = url.startsWith(BASE_URL) ? url.slice(BASE_URL.length) : url;
-  const cleanPath = path.split('?')[0];
-
-  // 1. 始终失效操作 URL 本身
-  invalidateAndBust(cleanPath);
-
-  // 2. /repos/:owner/:repo/contents/* — 文件写/删
-  const contentsMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+\/contents)/);
-  if (contentsMatch) {
-    invalidateAndBust(contentsMatch[1]);         // 失效该 repo 所有 contents 缓存
-  }
-
-  // 3. /repos/:owner/:repo（仓库本身的 PATCH/DELETE）
-  const repoRootMatch = cleanPath.match(/^\/repos\/([^/]+)\/([^/]+)$/);
-  if (repoRootMatch && (method === 'DELETE' || method === 'PATCH')) {
-    const [, owner] = repoRootMatch;
-    invalidateAndBust('/user/repos');            // 当前用户仓库列表
-    invalidateAndBust(`/users/${owner}/repos`); // 该用户公开仓库列表
-    invalidateAndBust(`/orgs/${owner}/repos`);  // 兼容 org 场景
-  }
-
-  // 4. /user/repos（创建新仓库）
-  if (cleanPath === '/user/repos' && method === 'POST') {
-    invalidateAndBust('/user/repos');
-  }
-
-  // 5. /repos/:owner/:repo/git/refs — 分支创建/删除
-  const refsMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+)\//);
-  if (cleanPath.includes('/git/refs') && refsMatch) {
-    invalidateAndBust(`${refsMatch[1]}/branches`);
-    invalidateAndBust(`${refsMatch[1]}/git/refs`);
-  }
-
-  // 6. /repos/:owner/:repo/issues（含 comments、labels）
-  const issueMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+)\/issues/);
-  if (issueMatch) {
-    invalidateAndBust(`${issueMatch[1]}/issues`);
-    invalidateAndBust(`${issueMatch[1]}/pulls`);  // PR 列表也要刷新（共享端点）
-  }
-
-  // 7. /repos/:owner/:repo/pulls/:number（含 merge、review、comments）
-  const prMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+)\/pulls/);
-  if (prMatch) {
-    invalidateAndBust(`${prMatch[1]}/pulls`);
-    invalidateAndBust(`${prMatch[1]}/issues`);
-  }
-
-  // 8. /repos/:owner/:repo/collaborators
-  const collabMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+\/collaborators)/);
-  if (collabMatch) {
-    invalidateAndBust(collabMatch[1]);
-  }
-
-  // 9. /gists — 创建/更新/删除 Gist
-  if (cleanPath.startsWith('/gists')) {
-    invalidateAndBust('/gists');
-  }
-
-  // 10. /user/starred — star/unstar 操作
-  if (cleanPath.startsWith('/user/starred')) {
-    invalidateAndBust('/user/starred');
-    invalidateAndBust(cleanPath);               // checkStarred 精确 key
-  }
-
-  // 11. /repos/:owner/:repo/actions — 工作流触发/取消
-  const actionsMatch = cleanPath.match(/^(\/repos\/[^/]+\/[^/]+\/actions)/);
-  if (actionsMatch) {
-    invalidateAndBust(actionsMatch[1]);
-  }
-}
-
-// ── In-flight 请求合并层 ────────────────────────────────────────────
-// 当多个组件同时调用同一 GET 接口（如仓库列表同时被侧边栏和主页面请求）时，
-// 只有第一个请求会真正发出，后续相同 URL + token 的请求直接共享同一个 Promise。
-// 请求完成（成功或失败）后，该 Promise 从 inFlightMap 中移除。
-const inFlightMap = new Map<string, Promise<unknown>>();
-
-/**
- * 从 in-flight Map 中获取已有的进行中请求，若不存在则创建并注册新 Promise。
- * 泛型 T 由调用方（request / requestWithPagination）保证类型安全。
- */
-export function getOrCreateInFlight<T>(key: string, factory: () => Promise<T>): Promise<T> {
-  const existing = inFlightMap.get(key);
-  if (existing) return existing as Promise<T>;
-  const promise = factory().finally(() => inFlightMap.delete(key));
-  inFlightMap.set(key, promise as Promise<unknown>);
-  return promise;
-}
-
-export function setToken(token: string | null) {
-  // token 变更（退出登录）时清空所有缓存，防止旧用户数据泄露
-  if (token !== authToken) clearApiCache();
-  authToken = token;
-}
-
-export function getToken(): string | null {
-  return authToken;
-}
-
-// 构建请求头
-function buildHeaders(): HeadersInit {
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-  return headers;
-}
-
-// 通用请求方法
-async function request<T>(
-  path: string,
-  options: RequestInit = {}
-): Promise<T> {
-  const url = path.startsWith('http') ? path : `${BASE_URL}${path}`;
-  const method = (options.method ?? 'GET').toUpperCase();
-
-  if (method === 'GET') {
-    const cacheKey = buildCacheKey(url);
-
-    // 1. TTL 缓存命中：直接返回，不发网络请求
-    const cached = getCached<T>(cacheKey);
-    if (cached !== null) return cached;
-
-    // 2. In-flight 合并：若相同请求正在进行中，共享同一 Promise
-    //    fetchUrl 可能附加 _t 时间戳以绕过 GitHub CDN 强制缓存（60s），
-    //    但 cacheKey 始终用干净 URL，确保时间戳不污染内存缓存键。
-    const fetchUrl = consumeCacheBust(url);
-    return getOrCreateInFlight<T>(cacheKey, async () => {
-      const response = await fetch(fetchUrl, {
-        ...options,
-        headers: { ...buildHeaders(), ...options.headers },
-      });
-      if (!response.ok) {
-        let errorMessage = `HTTP ${response.status}`;
-        try {
-          const errorBody = await response.json() as { message?: string };
-          errorMessage = errorBody.message || errorMessage;
-        } catch { /* 忽略 JSON 解析错误 */ }
-        const error = new Error(errorMessage) as Error & { status: number };
-        error.status = response.status;
-        throw error;
-      }
-      if (response.status === 204) return undefined as T;
-      const data = await response.json() as T;
-      setCached(cacheKey, data);
-      return data;
-    });
-  }
-
-  // 非 GET 请求：直接发出，完成后失效相关缓存前缀
-  const response = await fetch(url, {
-    ...options,
-    headers: { ...buildHeaders(), ...options.headers },
-  });
-  if (!response.ok) {
-    let errorMessage = `HTTP ${response.status}`;
-    try {
-      const errorBody = await response.json() as { message?: string };
-      errorMessage = errorBody.message || errorMessage;
-    } catch { /* 忽略 JSON 解析错误 */ }
-    const error = new Error(errorMessage) as Error & { status: number };
-    error.status = response.status;
-    throw error;
-  }
-  if (response.status === 204) {
-    invalidateCacheForMutation(url, method);
-    return undefined as T;
-  }
-  const data = await response.json() as T;
-  invalidateCacheForMutation(url, method);
-  return data;
-}
-
-// 从响应头获取分页链接
-function parseLinkHeader(link: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  const parts = link.split(',');
-  for (const part of parts) {
-    const match = part.match(/<([^>]+)>;\s*rel="([^"]+)"/);
-    if (match) {
-      result[match[2]] = match[1];
-    }
-  }
-  return result;
-}
-
-// 带分页信息的请求
-async function requestWithPagination<T>(
-  path: string,
-  options: RequestInit = {}
-): Promise<{ data: T[]; hasNextPage: boolean; totalCount?: number }> {
-  const url = path.startsWith('http') ? path : `${BASE_URL}${path}`;
-  const method = (options.method ?? 'GET').toUpperCase();
-
-  if (method === 'GET') {
-    const cacheKey = buildCacheKey(url);
-
-    // 1. TTL 缓存命中
-    const cached = getCached<{ data: T[]; hasNextPage: boolean }>(cacheKey);
-    if (cached !== null) return cached;
-
-    // 2. In-flight 合并（fetchUrl 可能附加 _t 绕过 GitHub CDN 强制缓存）
-    const fetchUrl = consumeCacheBust(url);
-    return getOrCreateInFlight<{ data: T[]; hasNextPage: boolean }>(cacheKey, async () => {
-      const response = await fetch(fetchUrl, {
-        ...options,
-        headers: { ...buildHeaders(), ...options.headers },
-      });
-      if (!response.ok) {
-        let errorMessage = `HTTP ${response.status}`;
-        try {
-          const errorBody = await response.json() as { message?: string };
-          errorMessage = errorBody.message || errorMessage;
-        } catch { /* 忽略 */ }
-        const error = new Error(errorMessage) as Error & { status: number };
-        error.status = response.status;
-        throw error;
-      }
-      const data = await response.json() as T[];
-      const linkHeader = response.headers.get('Link');
-      const links = linkHeader ? parseLinkHeader(linkHeader) : {};
-      const result = { data, hasNextPage: !!links.next };
-      setCached(cacheKey, result);
-      return result;
-    });
-  }
-
-  // 非 GET 分页请求（极少见，直接发出）
-  const response = await fetch(url, {
-    ...options,
-    headers: { ...buildHeaders(), ...options.headers },
-  });
-  if (!response.ok) {
-    let errorMessage = `HTTP ${response.status}`;
-    try {
-      const errorBody = await response.json() as { message?: string };
-      errorMessage = errorBody.message || errorMessage;
-    } catch { /* 忽略 */ }
-    const error = new Error(errorMessage) as Error & { status: number };
-    error.status = response.status;
-    throw error;
-  }
-  const data = await response.json() as T[];
-  const linkHeader = response.headers.get('Link');
-  const links = linkHeader ? parseLinkHeader(linkHeader) : {};
-  invalidateCacheForMutation(url, method);
-  return { data, hasNextPage: !!links.next };
-}
+import { createHttpError } from '@/services/github/http';
+import { BASE_URL, buildCacheKey, buildHeaders, getCached, getToken, invalidateAndBust, request, requestWithPagination, setCached } from '@/services/github/core';
+export {
+  buildCacheKey,
+  getCached,
+  getCacheEntry,
+  touchCached,
+  setCached,
+  invalidateCache,
+  clearApiCache,
+  getOrCreateInFlight,
+  setToken,
+  getToken,
+} from '@/services/github/core';
+export { formatRelativeTime, formatNumber, getLanguageColor } from '@/services/github/format';
+export * from '@/services/github/gists';
+export * from '@/services/github/actions';
+export * from '@/services/github/issues';
+export * from '@/services/github/pulls';
+import type { GitHubArtifact } from '@/services/github/actions';
 
 // ===== 用户 API =====
 
@@ -443,7 +110,7 @@ function detectTokenType(token: string): GithubTokenType {
  * 能做的只有：验证当前 Token、读取它自身的作用域/过期时间/额度，并管理本机保存的 Token。
  */
 export async function getTokenMetadata(tokenOverride?: string): Promise<TokenMetadata> {
-  const token = tokenOverride ?? authToken ?? '';
+  const token = tokenOverride ?? getToken() ?? '';
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
@@ -603,256 +270,6 @@ export async function getRepoTopics(
 }
 
 // ===== Issue API =====
-
-export async function getIssues(
-  owner: string,
-  repo: string,
-  params: {
-    state?: IssueState;
-    sort?: IssueSortField;
-    direction?: SortDirection;
-    per_page?: number;
-    page?: number;
-    labels?: string;
-    milestone?: string;
-    assignee?: string;
-  } = {}
-): Promise<{ data: GitHubIssue[]; hasNextPage: boolean }> {
-  const {
-    state = 'open',
-    sort = 'created',
-    direction = 'desc',
-    per_page = 30,
-    page = 1,
-  } = params;
-  const queryParams = new URLSearchParams({
-    state,
-    sort,
-    direction,
-    per_page: String(per_page),
-    page: String(page),
-  });
-  if (params.labels) queryParams.set('labels', params.labels);
-  if (params.milestone) queryParams.set('milestone', params.milestone);
-  if (params.assignee) queryParams.set('assignee', params.assignee);
-
-  return requestWithPagination<GitHubIssue>(
-    `/repos/${owner}/${repo}/issues?${queryParams.toString()}`
-  );
-}
-
-export async function getIssue(
-  owner: string,
-  repo: string,
-  issueNumber: number
-): Promise<GitHubIssue> {
-  return request<GitHubIssue>(`/repos/${owner}/${repo}/issues/${issueNumber}`);
-}
-
-export async function createIssue(
-  owner: string,
-  repo: string,
-  params: {
-    title: string;
-    body?: string;
-    labels?: string[];
-    assignees?: string[];
-    milestone?: number;
-  }
-): Promise<GitHubIssue> {
-  return request<GitHubIssue>(`/repos/${owner}/${repo}/issues`, {
-    method: 'POST',
-    body: JSON.stringify(params),
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-export async function updateIssue(
-  owner: string,
-  repo: string,
-  issueNumber: number,
-  params: {
-    title?: string;
-    body?: string;
-    state?: 'open' | 'closed';
-    labels?: string[];
-    assignees?: string[];
-    milestone?: number | null;
-  }
-): Promise<GitHubIssue> {
-  return request<GitHubIssue>(
-    `/repos/${owner}/${repo}/issues/${issueNumber}`,
-    {
-      method: 'PATCH',
-      body: JSON.stringify(params),
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
-}
-
-export async function getIssueComments(
-  owner: string,
-  repo: string,
-  issueNumber: number,
-  page = 1
-): Promise<GitHubComment[]> {
-  return request<GitHubComment[]>(
-    `/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=50&page=${page}`
-  );
-}
-
-export async function createIssueComment(
-  owner: string,
-  repo: string,
-  issueNumber: number,
-  body: string
-): Promise<GitHubComment> {
-  return request<GitHubComment>(
-    `/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ body }),
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
-}
-
-export async function getRepoLabels(
-  owner: string,
-  repo: string
-): Promise<GitHubLabel[]> {
-  return request<GitHubLabel[]>(`/repos/${owner}/${repo}/labels?per_page=100`);
-}
-
-export async function getRepoMilestones(
-  owner: string,
-  repo: string
-): Promise<GitHubMilestone[]> {
-  return request<GitHubMilestone[]>(`/repos/${owner}/${repo}/milestones?per_page=100`);
-}
-
-// ===== Pull Request API =====
-
-export async function getPullRequests(
-  owner: string,
-  repo: string,
-  params: {
-    state?: PrState;
-    sort?: 'created' | 'updated' | 'popularity' | 'long-running';
-    direction?: SortDirection;
-    per_page?: number;
-    page?: number;
-    base?: string;
-    head?: string;
-  } = {}
-): Promise<{ data: GitHubPullRequest[]; hasNextPage: boolean }> {
-  const {
-    state = 'open',
-    sort = 'created',
-    direction = 'desc',
-    per_page = 30,
-    page = 1,
-  } = params;
-  const queryParams = new URLSearchParams({
-    state,
-    sort,
-    direction,
-    per_page: String(per_page),
-    page: String(page),
-  });
-  if (params.base) queryParams.set('base', params.base);
-  if (params.head) queryParams.set('head', params.head);
-
-  return requestWithPagination<GitHubPullRequest>(
-    `/repos/${owner}/${repo}/pulls?${queryParams.toString()}`
-  );
-}
-
-export async function getPullRequest(
-  owner: string,
-  repo: string,
-  prNumber: number
-): Promise<GitHubPullRequest> {
-  return request<GitHubPullRequest>(`/repos/${owner}/${repo}/pulls/${prNumber}`);
-}
-
-export async function getPullRequestFiles(
-  owner: string,
-  repo: string,
-  prNumber: number
-): Promise<import('@/types/types').GitHubFile[]> {
-  return request<import('@/types/types').GitHubFile[]>(
-    `/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`
-  );
-}
-
-export async function mergePullRequest(
-  owner: string,
-  repo: string,
-  prNumber: number,
-  params?: {
-    commit_title?: string;
-    commit_message?: string;
-    merge_method?: 'merge' | 'squash' | 'rebase';
-  }
-): Promise<{ sha: string; merged: boolean; message: string }> {
-  return request<{ sha: string; merged: boolean; message: string }>(
-    `/repos/${owner}/${repo}/pulls/${prNumber}/merge`,
-    {
-      method: 'PUT',
-      body: JSON.stringify(params || {}),
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
-}
-
-export async function updatePullRequest(
-  owner: string,
-  repo: string,
-  prNumber: number,
-  params: {
-    title?: string;
-    body?: string;
-    state?: 'open' | 'closed';
-  }
-): Promise<GitHubPullRequest> {
-  return request<GitHubPullRequest>(
-    `/repos/${owner}/${repo}/pulls/${prNumber}`,
-    {
-      method: 'PATCH',
-      body: JSON.stringify(params),
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
-}
-
-export async function getPullRequestComments(
-  owner: string,
-  repo: string,
-  prNumber: number
-): Promise<GitHubComment[]> {
-  return request<GitHubComment[]>(
-    `/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=50`
-  );
-}
-
-export async function createPullRequestComment(
-  owner: string,
-  repo: string,
-  prNumber: number,
-  body: string
-): Promise<GitHubComment> {
-  return request<GitHubComment>(
-    `/repos/${owner}/${repo}/issues/${prNumber}/comments`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ body }),
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
-}
-
-// ===== 提交 API =====
 
 export async function getCommits(
   owner: string,
@@ -1189,6 +606,8 @@ export async function getNotifications(params: {
 
 export async function markNotificationRead(threadId: string): Promise<void> {
   await request<void>(`/notifications/threads/${threadId}`, { method: 'PATCH' });
+  // 顶栏红点与通知列表会重新拉取，必须清掉带 ETag 的通知缓存。
+  invalidateAndBust('/notifications');
 }
 
 export async function deleteNotification(threadId: string): Promise<void> {
@@ -1203,6 +622,8 @@ export async function markAllNotificationsRead(): Promise<void> {
     body: JSON.stringify({ read: true }),
     headers: { 'Content-Type': 'application/json' },
   });
+  // 全部已读后，顶栏下一次查询必须命中空列表而不是旧 ETag 缓存。
+  invalidateAndBust('/notifications');
 }
 
 // ===== 内容/代码浏览 API =====
@@ -1246,7 +667,12 @@ export async function getFileContent(
 
 export async function searchRepositories(
   query: string,
-  params: { sort?: 'stars' | 'forks' | 'updated'; order?: SortDirection; per_page?: number; page?: number } = {}
+  params: {
+    sort?: 'stars' | 'forks' | 'updated' | 'help-wanted-issues';
+    order?: SortDirection;
+    per_page?: number;
+    page?: number;
+  } = {}
 ): Promise<GitHubSearchResult<GitHubRepo>> {
   const { sort, order = 'desc', per_page = 20, page = 1 } = params;
   const q = encodeURIComponent(query);
@@ -1258,29 +684,46 @@ export async function searchRepositories(
 
 export async function searchIssues(
   query: string,
-  params: { sort?: 'created' | 'updated' | 'comments'; order?: SortDirection; per_page?: number; page?: number } = {}
+  params: {
+    sort?: 'created' | 'updated' | 'comments' | 'reactions' | 'interactions';
+    order?: SortDirection;
+    per_page?: number;
+    page?: number;
+  } = {}
 ): Promise<GitHubSearchResult<GitHubIssue>> {
-  const { sort = 'created', order = 'desc', per_page = 20, page = 1 } = params;
+  const { sort, order = 'desc', per_page = 20, page = 1 } = params;
   const q = encodeURIComponent(query);
+  const sortQS = sort ? `&sort=${sort}&order=${order}` : '';
   return request<GitHubSearchResult<GitHubIssue>>(
-    `/search/issues?q=${q}&sort=${sort}&order=${order}&per_page=${per_page}&page=${page}`
+    `/search/issues?q=${q}${sortQS}&per_page=${per_page}&page=${page}`
   );
 }
 
 export async function searchUsers(
   query: string,
-  params: { sort?: 'followers' | 'repositories' | 'joined'; order?: SortDirection; per_page?: number; page?: number } = {}
+  params: {
+    sort?: 'followers' | 'repositories' | 'joined';
+    order?: SortDirection;
+    per_page?: number;
+    page?: number;
+  } = {}
 ): Promise<GitHubSearchResult<GitHubUser>> {
-  const { sort = 'followers', order = 'desc', per_page = 20, page = 1 } = params;
+  const { sort, order = 'desc', per_page = 20, page = 1 } = params;
   const q = encodeURIComponent(query);
+  const sortQS = sort ? `&sort=${sort}&order=${order}` : '';
   return request<GitHubSearchResult<GitHubUser>>(
-    `/search/users?q=${q}&sort=${sort}&order=${order}&per_page=${per_page}&page=${page}`
+    `/search/users?q=${q}${sortQS}&per_page=${per_page}&page=${page}`
   );
 }
 
 export async function searchCode(
   query: string,
-  params: { per_page?: number; page?: number } = {}
+  params: {
+    sort?: 'indexed';
+    order?: SortDirection;
+    per_page?: number;
+    page?: number;
+  } = {}
 ): Promise<GitHubSearchResult<{
   name: string;
   path: string;
@@ -1289,8 +732,9 @@ export async function searchCode(
   repository: GitHubRepo;
   score: number;
 }>> {
-  const { per_page = 20, page = 1 } = params;
+  const { sort, order = 'desc', per_page = 20, page = 1 } = params;
   const q = encodeURIComponent(query);
+  const sortQS = sort ? `&sort=${sort}&order=${order}` : '';
   return request<GitHubSearchResult<{
     name: string;
     path: string;
@@ -1298,7 +742,7 @@ export async function searchCode(
     html_url: string;
     repository: GitHubRepo;
     score: number;
-  }>>(`/search/code?q=${q}&per_page=${per_page}&page=${page}`);
+  }>>(`/search/code?q=${q}${sortQS}&per_page=${per_page}&page=${page}`);
 }
 
 // ===== 文件写入 =====
@@ -1342,171 +786,6 @@ export async function deleteFileContent(
 }
 
 // ===== GitHub Actions =====
-export async function getWorkflows(
-  owner: string,
-  repo: string
-): Promise<{ total_count: number; workflows: import('@/types/types').GitHubWorkflow[] }> {
-  const workflows: import('@/types/types').GitHubWorkflow[] = [];
-  let page = 1;
-  let total = 0;
-  // GitHub 默认每页 30 条；必须分页拉取，否则工作流较多时会漏项。
-  while (page <= 10) {
-    const res = await request<{ total_count: number; workflows: import('@/types/types').GitHubWorkflow[] }>(
-      `/repos/${owner}/${repo}/actions/workflows?per_page=100&page=${page}`
-    );
-    total = Number(res.total_count ?? 0);
-    workflows.push(...(res.workflows ?? []));
-    if ((res.workflows?.length ?? 0) < 100 || workflows.length >= total) break;
-    page++;
-  }
-  return { total_count: total, workflows };
-}
-
-export async function getWorkflowRuns(
-  owner: string,
-  repo: string,
-  params: { workflow_id?: number | string; status?: string; per_page?: number; page?: number } = {}
-): Promise<{ total_count: number; workflow_runs: import('@/types/types').GitHubWorkflowRun[] }> {
-  const { workflow_id, status, per_page = 20, page = 1 } = params;
-  const base = workflow_id
-    ? `/repos/${owner}/${repo}/actions/workflows/${workflow_id}/runs`
-    : `/repos/${owner}/${repo}/actions/runs`;
-  const qs = new URLSearchParams({ per_page: String(per_page), page: String(page) });
-  if (status) qs.set('status', status);
-  return request(`${base}?${qs}`);
-}
-
-export async function getWorkflowRun(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<import('@/types/types').GitHubWorkflowRun> {
-  return request(`/repos/${owner}/${repo}/actions/runs/${runId}`);
-}
-
-export async function triggerWorkflow(
-  owner: string,
-  repo: string,
-  workflowId: number | string,
-  ref: string,
-  inputs: Record<string, string> = {}
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/workflows/${workflowId}/dispatches`, {
-    method: 'POST',
-    body: JSON.stringify({ ref, inputs }),
-  });
-}
-
-export async function enableWorkflow(
-  owner: string,
-  repo: string,
-  workflowId: number | string
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/workflows/${workflowId}/enable`, {
-    method: 'PUT',
-  });
-}
-
-export async function disableWorkflow(
-  owner: string,
-  repo: string,
-  workflowId: number | string
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/workflows/${workflowId}/disable`, {
-    method: 'PUT',
-  });
-}
-
-export async function cancelWorkflowRun(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, {
-    method: 'POST',
-  });
-}
-
-export async function rerunWorkflowRun(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun`, {
-    method: 'POST',
-  });
-}
-
-export async function rerunFailedWorkflowRun(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, {
-    method: 'POST',
-  });
-}
-
-export async function rerunWorkflowJob(
-  owner: string,
-  repo: string,
-  jobId: number
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/jobs/${jobId}/rerun`, {
-    method: 'POST',
-  });
-}
-
-export async function getWorkflowRunJobs(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<{ total_count: number; jobs: import('@/types/types').GitHubWorkflowJob[] }> {
-  return request(`/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=100`);
-}
-
-export async function getRunArtifacts(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<{ total_count: number; artifacts: GitHubArtifact[] }> {
-  return request<{ total_count: number; artifacts: GitHubArtifact[] }>(
-    `/repos/${owner}/${repo}/actions/runs/${runId}/artifacts?per_page=100`
-  );
-}
-
-export interface GitHubPendingDeployment {
-  environment: { id: number; name: string; url?: string };
-  wait_timer?: number;
-  current_user_can_approve: boolean;
-  reviewers?: Array<{ type: string; reviewer: { login?: string; name?: string } }>;
-}
-
-export async function getPendingDeployments(
-  owner: string,
-  repo: string,
-  runId: number
-): Promise<GitHubPendingDeployment[]> {
-  return request<GitHubPendingDeployment[]>(
-    `/repos/${owner}/${repo}/actions/runs/${runId}/pending_deployments`
-  );
-}
-
-export async function reviewPendingDeployments(
-  owner: string,
-  repo: string,
-  runId: number,
-  environmentIds: number[],
-  state: 'approved' | 'rejected',
-  comment = ''
-): Promise<void> {
-  await request<unknown>(`/repos/${owner}/${repo}/actions/runs/${runId}/pending_deployments`, {
-    method: 'POST',
-    body: JSON.stringify({ environment_ids: environmentIds, state, comment }),
-  });
-}
-
-// ===== GitHub Packages =====
 export async function getUserPackages(
   username: string,
   packageType: string = 'container'
@@ -1625,65 +904,6 @@ export async function moveProjectCard(
 }
 
 // ===== GitHub Gists =====
-export async function getGists(
-  params: { per_page?: number; page?: number } = {}
-): Promise<import('@/types/types').GitHubGist[]> {
-  const { per_page = 30, page = 1 } = params;
-  return request(`/gists?per_page=${per_page}&page=${page}`);
-}
-
-export async function getGist(gistId: string): Promise<import('@/types/types').GitHubGistDetail> {
-  return request(`/gists/${gistId}`);
-}
-
-export async function createGist(data: {
-  description: string;
-  public: boolean;
-  files: Record<string, { content: string }>;
-}): Promise<import('@/types/types').GitHubGistDetail> {
-  return request('/gists', { method: 'POST', body: JSON.stringify(data) });
-}
-
-export async function updateGist(
-  gistId: string,
-  data: {
-    description?: string;
-    files?: Record<string, { content: string } | null>;
-  }
-): Promise<import('@/types/types').GitHubGistDetail> {
-  return request(`/gists/${gistId}`, { method: 'PATCH', body: JSON.stringify(data) });
-}
-
-export async function deleteGist(gistId: string): Promise<void> {
-  await request<unknown>(`/gists/${gistId}`, { method: 'DELETE' });
-}
-
-export async function forkGist(gistId: string): Promise<import('@/types/types').GitHubGistDetail> {
-  return request(`/gists/${gistId}/forks`, { method: 'POST' });
-}
-
-export async function starGist(gistId: string): Promise<void> {
-  await request<unknown>(`/gists/${gistId}/star`, { method: 'PUT' });
-}
-
-export async function unstarGist(gistId: string): Promise<void> {
-  await request<unknown>(`/gists/${gistId}/star`, { method: 'DELETE' });
-}
-
-export async function getGistComments(
-  gistId: string
-): Promise<import('@/types/types').GitHubComment[]> {
-  return request(`/gists/${gistId}/comments`);
-}
-
-export async function createGistComment(
-  gistId: string,
-  body: string
-): Promise<import('@/types/types').GitHubComment> {
-  return request(`/gists/${gistId}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
-}
-
-// ===== GitHub Discussions (REST, limited) =====
 export async function getDiscussions(
   owner: string,
   repo: string,
@@ -1707,63 +927,6 @@ export async function getLicenses(): Promise<Array<{ key: string; name: string; 
 }
 
 // ===== 格式化工具 =====
-
-export function formatRelativeTime(dateString: string): string {
-  const date = new Date(dateString);
-  const now = new Date();
-  const diff = now.getTime() - date.getTime();
-  const seconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const months = Math.floor(days / 30);
-  const years = Math.floor(days / 365);
-
-  if (seconds < 60) return i18n.t('刚刚');
-  if (minutes < 60) return `${minutes} 分钟前`;
-  if (hours < 24) return `${hours} 小时前`;
-  if (days < 30) return `${days} 天前`;
-  if (months < 12) return `${months} 个月前`;
-  return `${years} 年前`;
-}
-
-export function formatNumber(num: number): string {
-  if (num >= 1000) {
-    return `${(num / 1000).toFixed(1)}k`;
-  }
-  return String(num);
-}
-
-export function getLanguageColor(language: string): string {
-  const colors: Record<string, string> = {
-    TypeScript: '#3178c6',
-    JavaScript: '#f1e05a',
-    Python: '#3572A5',
-    Java: '#b07219',
-    Go: '#00ADD8',
-    Rust: '#dea584',
-    C: '#555555',
-    'C++': '#f34b7d',
-    'C#': '#178600',
-    Ruby: '#701516',
-    PHP: '#4F5D95',
-    Swift: '#F05138',
-    Kotlin: '#A97BFF',
-    Dart: '#00B4AB',
-    Shell: '#89e051',
-    HTML: '#e34c26',
-    CSS: '#563d7c',
-    Vue: '#41b883',
-    Svelte: '#ff3e00',
-    Scala: '#c22d40',
-    Elixir: '#6e4a7e',
-    Haskell: '#5e5086',
-    Lua: '#000080',
-    MATLAB: '#e16737',
-    R: '#198CE7',
-  };
-  return colors[language] || '#6b7280';
-}
 
 // ===== GitHub Pages API =====
 
@@ -1887,18 +1050,6 @@ export interface GitHubReleaseAsset {
   browser_download_url: string;
   created_at: string;
   updated_at: string;
-}
-
-export interface GitHubArtifact {
-  id: number;
-  name: string;
-  size_in_bytes: number;
-  expired: boolean;
-  expires_at: string | null;
-  created_at: string;
-  updated_at: string;
-  archive_download_url: string;
-  workflow_run: { id: number; head_branch: string; head_sha: string; event: string } | null;
 }
 
 export async function createRelease(
@@ -2133,6 +1284,73 @@ export async function getStarredRepos(params: {
   return request<GitHubRepo[]>(
     `/user/starred?per_page=${per_page}&page=${page}&sort=${sort}&direction=${direction}`
   );
+}
+
+/**
+ * 获取全部收藏仓库（分页拉全，带 starred_at）。
+ * 收藏页需要本地排序，只拿第一页会导致排序与 GitHub 网页不一致。
+ * per_page=100 时最多 10 页（1000 个），超出部分忽略，避免无限翻页。
+ */
+/**
+ * 获取全部收藏仓库（并发分页，带 starred_at）。
+ * 串行翻页时 529 个星标要 6 次往返（≈10s）；这里先取首页让 UI 立刻出内容，
+ * 剩余页并发拉取，把总耗时压到 2~3 次往返。
+ */
+export async function getAllStarredRepos(
+  sort: 'created' | 'updated' = 'created',
+  direction: 'asc' | 'desc' = 'desc',
+  onFirstPage?: (repos: GitHubRepo[]) => void,
+): Promise<GitHubRepo[]> {
+  const perPage = 100;
+  const maxPages = 20;
+  const batchSize = 6;
+
+  const fetchPage = async (page: number): Promise<GitHubRepo[]> => {
+    const rows = await request<unknown[]>(
+      `/user/starred?per_page=${perPage}&page=${page}&sort=${sort}&direction=${direction}`,
+      { headers: { Accept: 'application/vnd.github.star+json' } },
+    );
+    if (!Array.isArray(rows)) return [];
+    return rows.map((item) => {
+      const record = item as Record<string, unknown> | null;
+      if (record && typeof record === 'object' && 'repo' in record) {
+        const repo = record.repo as GitHubRepo;
+        return { ...repo, starred_at: typeof record.starred_at === 'string' ? record.starred_at : undefined };
+      }
+      return item as GitHubRepo;
+    });
+  };
+
+  const first = await fetchPage(1);
+  if (onFirstPage && first.length > 0) onFirstPage(first);
+  if (first.length < perPage) return first;
+
+  const all: GitHubRepo[] = [...first];
+  let nextPage = 2;
+  let finished = false;
+  while (!finished && nextPage <= maxPages) {
+    const pages: number[] = [];
+    for (let i = 0; i < batchSize && nextPage + i <= maxPages; i += 1) pages.push(nextPage + i);
+    const settled = await Promise.allSettled(pages.map((page) => fetchPage(page)));
+    const ordered: GitHubRepo[][] = pages.map(() => []);
+    const retryPages: number[] = [];
+    settled.forEach((result, index) => {
+      if (result.status === 'fulfilled') ordered[index] = result.value;
+      else retryPages.push(pages[index]);
+    });
+    if (retryPages.length > 0) {
+      const retried = await Promise.allSettled(retryPages.map((page) => fetchPage(page)));
+      retried.forEach((result, index) => {
+        if (result.status === 'fulfilled') ordered[pages.indexOf(retryPages[index])] = result.value;
+      });
+    }
+    for (const rows of ordered) {
+      all.push(...rows);
+      if (rows.length < perPage) { finished = true; break; }
+    }
+    nextPage += pages.length;
+  }
+  return all;
 }
 
 /**

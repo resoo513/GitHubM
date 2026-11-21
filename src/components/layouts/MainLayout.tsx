@@ -44,6 +44,8 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useTheme, type ThemeMode } from '@/contexts/ThemeContext';
 import { useTranslationStore } from '@/stores/translationStore';
 import { viewportTranslator } from '@/lib/auto-translator';
+import { getNotifications } from '@/services/github';
+import { subscribeNotificationUnread } from '@/lib/notificationBadge';
 import { useEffect } from 'react';
 import { cn } from '@/lib/utils';
 import i18n from "@/i18n";
@@ -359,11 +361,42 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   const { theme: currentTheme, setTheme } = useTheme();
   const location = useLocation();
   const navigate = useNavigate();
+  const [hasUnreadNotifications, setHasUnreadNotifications] = useState(false);
 
   const targetLang = useTranslationStore(state => state.targetLang);
   const setTargetLang = useTranslationStore(state => state.setTargetLang);
 
   const ThemeIcon = themeIcons[currentTheme];
+
+  useEffect(() => {
+    if (!user) {
+      setHasUnreadNotifications(false);
+      return;
+    }
+    let cancelled = false;
+    const refresh = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      try {
+        const result = await getNotifications({ all: false, per_page: 1 });
+        if (!cancelled) setHasUnreadNotifications(result.data.some((item) => item.unread));
+      } catch {
+        // 通知接口失败时不改动现有红点状态，避免误清除。
+      }
+    };
+    void refresh();
+    const unsubscribe = subscribeNotificationUnread(setHasUnreadNotifications);
+    const interval = window.setInterval(refresh, 60_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [user]);
 
   const cycleTheme = () => {
     const order: ThemeMode[] = ['light', 'dark', 'system'];
@@ -376,6 +409,10 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
       location.pathname === item.path ||
       (item.path !== '/' && location.pathname.startsWith(item.path))
   );
+
+  const pageTitle = location.pathname === '/settings' || location.pathname.startsWith('/settings/')
+    ? i18n.t('我的')
+    : currentNavItem?.label || i18n.t('GitHub 管理器');
 
   const handleLogout = () => {
     logout();
@@ -402,7 +439,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
           {/* 移动端菜单按钮 */}
           <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
             <SheetTrigger asChild>
-              <Button variant="ghost" size="icon" className="lg:hidden text-foreground hover:bg-secondary">
+              <Button variant="ghost" size="icon" className="topbar-icon lg:hidden text-foreground hover:bg-secondary">
                 <Menu className="w-5 h-5" />
               </Button>
             </SheetTrigger>
@@ -415,7 +452,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
           <Button
             variant="ghost"
             size="icon"
-            className="hidden lg:flex text-muted-foreground hover:bg-secondary"
+            className="topbar-icon hidden lg:flex text-muted-foreground hover:bg-secondary"
             onClick={() => setCollapsed(!collapsed)}
           >
             {collapsed ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
@@ -424,7 +461,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
           {/* 当前页面标题 */}
           <div className="flex-1 min-w-0">
             <span className="text-sm font-semibold text-foreground truncate">
-              {currentNavItem?.label || i18n.t('GitHub 管理器')}
+              {pageTitle}
             </span>
           </div>
 
@@ -451,7 +488,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="text-muted-foreground hover:bg-secondary"
+                  className="topbar-icon text-muted-foreground hover:bg-secondary"
                   onClick={cycleTheme}
                 >
                   <ThemeIcon className="w-4 h-4" />
@@ -470,7 +507,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
                     <Button
                       variant="ghost"
                       size="icon"
-                      className={cn("text-muted-foreground hover:bg-secondary", targetLang !== 'off' && "text-primary")}
+                      className={cn("topbar-icon text-muted-foreground hover:bg-secondary", targetLang !== 'off' && "text-primary")}
                     >
                       <Languages className="w-4 h-4" />
                     </Button>
@@ -495,10 +532,14 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
             <Button
               variant="ghost"
               size="icon"
-              className="text-muted-foreground hover:bg-secondary"
+              className="topbar-icon relative text-muted-foreground hover:bg-secondary"
               onClick={() => navigate('/notifications')}
+              aria-label={hasUnreadNotifications ? i18n.t('通知（有未读）') : i18n.t('通知')}
             >
               <Bell className="w-4 h-4" />
+              {hasUnreadNotifications && (
+                <span className="absolute right-1.5 top-1.5 w-2 h-2 rounded-full bg-destructive ring-2 ring-card" />
+              )}
             </Button>
 
             {/* 全部功能（九宫格）：Android 端原生底部导航仅 5 个 Tab，
@@ -506,7 +547,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
             <Button
               variant="ghost"
               size="icon"
-              className="text-muted-foreground hover:bg-secondary"
+              className="topbar-icon text-muted-foreground hover:bg-secondary"
               onClick={() => navigate('/more')}
               aria-label="全部功能"
             >
@@ -517,7 +558,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
             {user && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" className="flex items-center gap-2 px-2 h-9 text-foreground hover:bg-secondary">
+                  <Button variant="ghost" className="topbar-icon flex items-center gap-2 px-2 h-9 text-foreground hover:bg-secondary">
                     <Avatar className="w-6 h-6">
                       <AvatarImage src={user.avatar_url} alt={user.login} />
                       <AvatarFallback className="bg-primary/20 text-primary text-xs font-semibold">

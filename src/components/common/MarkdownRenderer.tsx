@@ -7,10 +7,12 @@
 // 点击后直接报 ERR_FILE_NOT_FOUND。这里在渲染阶段把相对地址还原成
 // 「仓库内路径」，点击时走应用内代码浏览路由；图片则转换为 raw.githubusercontent。
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { useNavigate } from 'react-router-dom';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeRaw from 'rehype-raw';
-import { useNavigate } from 'react-router-dom';
+import type { Options as SanitizeSchema } from 'rehype-sanitize';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import remarkGfm from 'remark-gfm';
 
 export interface RepoLinkContext {
   owner: string;
@@ -26,8 +28,45 @@ interface MarkdownRendererProps {
   className?: string;
   /** 传入后启用「仓库相对路径」解析；不传则保持原有行为 */
   repoContext?: RepoLinkContext;
+  /**
+   * 页内锚点「能否处理」的判定（纯函数，不得有副作用）。
+   *
+   * 评论里的 `#issuecomment-123` 这类链接，默认会当作外链开新窗口，
+   * 在 app 内等于跳出应用。返回 true 表示宿主认领该锚点。
+   *
+   * 注意：这个回调在 render 阶段被调用，必须保持纯粹。任何滚动/toast/请求
+   * 都必须放进 onAnchorClick，否则一屏出现 N 条带锚点的引用会触发 N 次副作用。
+   */
+  onAnchor?: (anchor: string) => boolean;
+  /** 锚点被点击时调用，跳转等副作用放这里。 */
+  onAnchorClick?: (anchor: string) => void;
 }
 
+/**
+ * Markdown 来自 Issue / PR / 仓库文件 / AI 工具返回，全部按不可信输入处理。
+ * rehype-raw 会保留内联 HTML，必须在它之后做 sanitize，否则 iframe[srcdoc]、
+ * 事件属性和 javascript: 链接可以直接接触页面上下文。
+ */
+const MARKDOWN_SANITIZE_SCHEMA: SanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [
+    ...(defaultSchema.tagNames ?? []),
+    'details', 'summary', 'kbd', 'del', 'ins', 'sup', 'sub', 'picture', 'source',
+  ],
+  attributes: {
+    ...defaultSchema.attributes,
+    '*': [...(defaultSchema.attributes?.['*'] ?? []), 'className', 'id'],
+    code: [['className', /^language-./]],
+    img: [...(defaultSchema.attributes?.img ?? []), 'loading', 'width', 'height'],
+    // GFM 任务列表
+    input: ['type', 'checked', 'disabled'],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    href: ['http', 'https', 'mailto'],
+    src: ['http', 'https'],
+  },
+};
 const ABSOLUTE_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
 /** 归一化仓库内相对路径：处理 ./ ../ 与多余的斜杠 */
@@ -176,14 +215,20 @@ export function resolveMarkdownImage(src: string | undefined, ctx?: RepoLinkCont
   return rawFileUrl(ctx, resolved);
 }
 
-export default function MarkdownRenderer({ content, className, repoContext }: MarkdownRendererProps) {
+export default function MarkdownRenderer({
+  content,
+  className,
+  repoContext,
+  onAnchor,
+  onAnchorClick,
+}: MarkdownRendererProps) {
   const navigate = useNavigate();
 
   return (
     <div className={`markdown-body ${className || ''}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight, rehypeRaw]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA], rehypeHighlight]}
         components={{
           // 安全处理图片（含仓库相对路径）
           img: ({ src, alt, node: _node, ...props }) => (
@@ -197,7 +242,57 @@ export default function MarkdownRenderer({ content, className, repoContext }: Ma
           ),
           // 链接：外部新标签；仓库内文件/目录走应用内路由
           a: ({ href, children, node: _node, ...props }) => {
-            const target = resolveMarkdownHref(typeof href === 'string' ? href : undefined, repoContext);
+            const rawHref = typeof href === 'string' ? href : undefined;
+
+            // 页内锚点优先：`#issuecomment-123`，或同仓库 issue 链接带的 hash。
+            // 交给宿主处理，避免在 app 内点一下就跳出到浏览器。
+            if (onAnchor && rawHref) {
+              const anchorHash = rawHref.startsWith('#') ? rawHref.slice(1) : '';
+              // 这里只做「能不能处理」的判断，不能执行跳转：
+              // remark 的 a 组件是在 render 阶段跑的，在这里调宿主回调会变成渲染副作用，
+              // 一屏若有多条带锚点的引用就会一次性触发多次。真正跳转放到 onClick。
+              if (anchorHash && onAnchor(anchorHash)) {
+                return (
+                  <a
+                    href={`#${anchorHash}`}
+                    {...props}
+                    onClick={(e) => {
+                      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                      e.preventDefault();
+                      onAnchorClick?.(anchorHash);
+                    }}
+                  >
+                    {children}
+                  </a>
+                );
+              }
+            }
+            const target = resolveMarkdownHref(rawHref, repoContext);
+
+            // 同仓库 issue/PR 链接带的 hash（引用块的出处链接就是这种形态），
+            // 也交给宿主，这样点「——来自 @xxx」能直接跳到该评论。
+            if (onAnchor && rawHref && /#issue(comment)?-/.test(rawHref)) {
+              const sameRepo =
+                !!repoContext &&
+                new RegExp(`github\\.com/${repoContext.owner}/${repoContext.repo}/`, 'i').test(rawHref);
+              const hash = rawHref.slice(rawHref.indexOf('#') + 1);
+              if (sameRepo && onAnchor(hash)) {
+                return (
+                  <a
+                    href={`#${hash}`}
+                    {...props}
+                    onClick={(e) => {
+                      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                      e.preventDefault();
+                      onAnchorClick?.(hash);
+                    }}
+                  >
+                    {children}
+                  </a>
+                );
+              }
+            }
+
 
             if (target?.kind === 'internal') {
               // README 内的语言切换（README.md / README.zh-CN.md 等）应切换 README 渲染，

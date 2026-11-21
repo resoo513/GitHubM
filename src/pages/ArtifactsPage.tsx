@@ -9,7 +9,6 @@ import {
   Trash2,
   Tag,
   Clock,
-  FileArchive,
   AlertCircle,
   ExternalLink,
   RefreshCw,
@@ -19,6 +18,7 @@ import {
   Upload,
   Share2,
 } from 'lucide-react';
+import MarkdownRenderer from '@/components/common/MarkdownRenderer';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -73,6 +73,9 @@ import { toast } from 'sonner';
 import { downloadGithubFile, isDownloadProxyEnabled } from '@/lib/githubDownload';
 import { copyToClipboard } from '@/lib/utils';
 import i18n from "@/i18n";
+import { useAuth } from "@/contexts/AuthContext";
+import { isRepoOwner } from "@/lib/repoPermissions";
+import { getAssetIcon } from '@/lib/assetIcon';
 
 interface ReleasePublishResultDetail {
   success: boolean;
@@ -144,6 +147,7 @@ async function downloadWithAuth(asset: { url: string; browser_download_url: stri
 
 function AssetItem({ asset }: { asset: GitHubReleaseAsset }) {
   const [downloading, setDownloading] = useState(false);
+  const { Icon: AssetIcon, color: assetIconColor, label: assetIconLabel } = getAssetIcon(asset.name);
 
   const handleDownload = async () => {
     setDownloading(true);
@@ -157,8 +161,10 @@ function AssetItem({ asset }: { asset: GitHubReleaseAsset }) {
   return (
     <div className="px-4 py-2.5 hover:bg-secondary/30 transition-colors">
       <div className="flex items-center gap-2 min-w-0">
-        <FileArchive className="w-4 h-4 text-muted-foreground shrink-0" />
-        <p className="text-sm text-foreground font-mono truncate">{asset.name}</p>
+        <span className="shrink-0 flex items-center" title={assetIconLabel} aria-label={assetIconLabel} role="img">
+          <AssetIcon className={`w-4 h-4 ${assetIconColor}`} />
+        </span>
+        <p className="text-sm text-foreground font-mono break-all min-w-0 leading-snug" title={`${assetIconLabel} · ${asset.name}`}>{asset.name}</p>
       </div>
       <div className="flex items-center justify-between gap-3 mt-1.5 pl-6">
         <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0 flex-wrap">
@@ -189,9 +195,11 @@ function AssetItem({ asset }: { asset: GitHubReleaseAsset }) {
 function ReleaseItem({
   release,
   onDelete,
+  canManage,
 }: {
   release: GitHubRelease;
   onDelete: (id: number) => void;
+  canManage: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [notesOpen, setNotesOpen] = useState(false);
@@ -221,7 +229,7 @@ function ReleaseItem({
             <span className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-semibold text-foreground font-mono">{release.tag_name}</span>
               {release.name && release.name !== release.tag_name && (
-                <span className="text-sm text-muted-foreground truncate">{release.name}</span>
+                <span className="text-sm text-muted-foreground break-all min-w-0">{release.name}</span>
               )}
               {release.draft && <Badge variant="outline" className="text-xs text-muted-foreground border-border">{i18n.t('草稿')}</Badge>}
               {release.prerelease && <Badge className="bg-warning/10 text-warning border-warning/30 text-xs">{i18n.t('预发布')}</Badge>}
@@ -246,7 +254,7 @@ function ReleaseItem({
         <Button
           variant="ghost"
           size="sm"
-          className={`${CARD_ACTION_BUTTON_CLASS} hover:text-destructive hover:bg-destructive/10`}
+          className={`${CARD_ACTION_BUTTON_CLASS} hover:text-destructive hover:bg-destructive/10 ${canManage ? '' : 'hidden'}`}
           onClick={() => onDelete(release.id)}
           title={i18n.t('删除 Release')}
         >
@@ -266,8 +274,8 @@ function ReleaseItem({
               </CollapsibleTrigger>
               <CollapsibleContent>
                 <div className="px-4 py-3 border-b border-border/50">
-                  <div className="text-sm text-foreground whitespace-pre-wrap break-words leading-relaxed max-h-72 overflow-y-auto rounded-md bg-background/60 border border-border/50 p-3">
-                    {release.body}
+                  <div className="text-sm text-foreground max-h-72 overflow-y-auto rounded-md bg-background/60 border border-border/50 p-3">
+                    <MarkdownRenderer content={release.body} className="markdown-compact" />
                   </div>
                 </div>
               </CollapsibleContent>
@@ -418,6 +426,8 @@ function ArtifactDownloadButton({ art, owner, repo }: { art: GitHubArtifact; own
 
 export default function ArtifactsPage() {
   const { owner, repo } = useParams<{ owner: string; repo: string }>();
+  const { user } = useAuth();
+  const canManage = isRepoOwner(owner, user?.login);
   const navigate = useNavigate();
   const [releases, setReleases] = useState<GitHubRelease[]>([]);
   const [artifacts, setArtifacts] = useState<GitHubArtifact[]>([]);
@@ -671,7 +681,7 @@ export default function ArtifactsPage() {
             <div className="space-y-2">
               {releases.map((rel) => (
                 <div key={rel.id} className="bg-card border border-border rounded-xl overflow-hidden">
-                  <ReleaseItem release={rel} onDelete={setDeleteRelTarget} />
+                  <ReleaseItem release={rel} onDelete={setDeleteRelTarget} canManage={canManage} />
                 </div>
               ))}
             </div>
@@ -705,54 +715,58 @@ export default function ArtifactsPage() {
             </div>
           ) : (
             <div className="space-y-2">
-              {artifacts.map((art) => (
-                <div key={art.id} className="bg-card border border-border rounded-xl overflow-hidden">
-                  <div className="px-4 pt-3 pb-2.5 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap min-w-0">
-                      <FileArchive className="w-4 h-4 text-muted-foreground shrink-0" />
-                      <span className="text-sm font-mono text-foreground break-all min-w-0">{art.name}</span>
-                      {art.expired && <Badge variant="outline" className="text-xs text-muted-foreground border-border">{i18n.t('已过期')}</Badge>}
+              {artifacts.map((art) => {
+                const artIcon = getAssetIcon(art.name);
+                const ArtIcon = artIcon.Icon;
+                return (
+                  <div key={art.id} className="bg-card border border-border rounded-xl overflow-hidden">
+                    <div className="px-4 pt-3 pb-2.5 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap min-w-0">
+                        <ArtIcon className={`w-4 h-4 shrink-0 ${artIcon.color}`} aria-label={artIcon.label} role="img" />
+                        <span className="text-sm font-mono text-foreground break-all min-w-0" title={`${artIcon.label} · ${art.name}`}>{art.name}</span>
+                        {art.expired && <Badge variant="outline" className="text-xs text-muted-foreground border-border">{i18n.t('已过期')}</Badge>}
+                      </div>
+                      <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground flex-wrap pl-6">
+                        <span>{formatBytes(art.size_in_bytes)}</span>
+                        <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{formatRelativeTime(art.created_at)}</span>
+                        {art.expires_at && !art.expired && (
+                          <span>{i18n.t('过期：')}{formatRelativeTime(art.expires_at)}</span>
+                        )}
+                        {art.workflow_run && (
+                          <span>{i18n.t('分支：')}<code className="font-mono">{art.workflow_run.head_branch}</code></span>
+                        )}
+                      </div>
                     </div>
-                    <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground flex-wrap pl-6">
-                      <span>{formatBytes(art.size_in_bytes)}</span>
-                      <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{formatRelativeTime(art.created_at)}</span>
-                      {art.expires_at && !art.expired && (
-                        <span>{i18n.t('过期：')}{formatRelativeTime(art.expires_at)}</span>
+                    <div className="flex items-center justify-end gap-2 px-3 py-2 border-t border-border bg-secondary/20">
+                      {!art.expired && (
+                        <ArtifactDownloadButton art={art} owner={owner ?? ''} repo={repo ?? ''} />
                       )}
-                      {art.workflow_run && (
-                        <span>{i18n.t('分支：')}<code className="font-mono">{art.workflow_run.head_branch}</code></span>
+                      {canManage && !art.expired && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={CARD_ACTION_BUTTON_CLASS}
+                          onClick={() => openPublishDialog(art)}
+                          title={i18n.t('发布到 Release')}
+                        >
+                          <Upload className="w-3.5 h-3.5" />
+                          {i18n.t('发布')}
+                        </Button>
                       )}
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-end gap-2 px-3 py-2 border-t border-border bg-secondary/20">
-                    {!art.expired && (
-                      <ArtifactDownloadButton art={art} owner={owner ?? ''} repo={repo ?? ''} />
-                    )}
-                    {!art.expired && (
                       <Button
                         variant="ghost"
                         size="sm"
-                        className={CARD_ACTION_BUTTON_CLASS}
-                        onClick={() => openPublishDialog(art)}
-                        title={i18n.t('发布到 Release')}
+                        className={`${CARD_ACTION_BUTTON_CLASS} hover:text-destructive hover:bg-destructive/10 ${canManage ? '' : 'hidden'}`}
+                        onClick={() => setDeleteArtTarget(art.id)}
+                        title={i18n.t('删除')}
                       >
-                        <Upload className="w-3.5 h-3.5" />
-                        {i18n.t('发布')}
+                        <Trash2 className="w-3.5 h-3.5" />
+                        {i18n.t('删除')}
                       </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className={`${CARD_ACTION_BUTTON_CLASS} hover:text-destructive hover:bg-destructive/10`}
-                      onClick={() => setDeleteArtTarget(art.id)}
-                      title={i18n.t('删除')}
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      {i18n.t('删除')}
-                    </Button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </TabsContent>

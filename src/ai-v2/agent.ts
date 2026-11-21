@@ -41,13 +41,14 @@ export function buildSystemPrompt(
     '4. 工具失败时如实说明，并给出可行的下一步。',
     '5. 回答使用用户使用的语言，默认中文；代码使用 Markdown 代码块。',
     '6. 不要声称执行了尚未执行的操作。',
+    '7. 读取大文件时按 offset/limit 分页读到结尾；返回中出现「内容未结束」时，必须继续读取，不能基于截断内容下结论。',
     '',
     repo
       ? [
           `当前可选仓库上下文：${repo.fullName}`,
           `当前分支：${repo.branch || repo.defaultBranch || 'main'}`,
           '你可以使用 GitHub 工具查看仓库信息、目录、文件和代码搜索结果。',
-          '需要修改文件时可使用 github_write_file 或批量 github_write_files；分支和 PR 可使用 github_create_branch、github_create_pull_request、github_merge_pull_request。',
+          '需要修改文件时可使用 github_write_file 或批量 github_write_files；修改已有大文件请优先用 github_edit_file 做局部替换（不需要输出整篇内容），超过单次输出上限的新文件用 github_append_file 分片追加，不要用补丁文件绕路；分支和 PR 可使用 github_create_branch、github_create_pull_request、github_merge_pull_request。',
           '这些写操作默认会请求用户确认，未确认不会执行。',
           '大型工具结果会保存为 Artifact，可通过 artifact_read 分页读取。',
         ].join('\n')

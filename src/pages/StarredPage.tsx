@@ -26,7 +26,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
-  getStarredRepos,
+  getAllStarredRepos,
   unstarRepo,
   formatRelativeTime,
   formatNumber,
@@ -39,15 +39,29 @@ import i18n from "@/i18n";
 
 type SortKey = 'updated' | 'created' | 'stars' | 'name';
 
+const PAGE_SIZE = 30;
+
+function toTime(value?: string): number {
+  return value ? new Date(value).getTime() : 0;
+}
+
 function sortRepos(repos: GitHubRepo[], sort: SortKey): GitHubRepo[] {
   return [...repos].sort((a, b) => {
+    let diff = 0;
     switch (sort) {
-      case 'stars': return b.stargazers_count - a.stargazers_count;
-      case 'name': return a.name.localeCompare(b.name);
-      case 'created': return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      case 'stars': diff = b.stargazers_count - a.stargazers_count; break;
+      case 'name': diff = a.name.localeCompare(b.name); break;
+      // 收藏时间：优先 starred_at（与 GitHub 网页一致），缺失时回退仓库创建时间
+      case 'created': diff = toTime(b.starred_at || b.created_at) - toTime(a.starred_at || a.created_at); break;
+      // 最近活跃 = 最后一次推送；GitHub 官方 /user/starred?sort=updated 就是按 pushed_at 排的
       case 'updated':
-      default: return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+      default: diff = toTime(b.pushed_at || b.updated_at) - toTime(a.pushed_at || a.updated_at); break;
     }
+    if (diff !== 0) return diff;
+    // 时间戳相同（批量推送）时用 star 数、全名兜底，避免顺序抖动
+    const byStars = b.stargazers_count - a.stargazers_count;
+    if (byStars !== 0) return byStars;
+    return a.full_name.localeCompare(b.full_name);
   });
 }
 
@@ -55,49 +69,45 @@ export default function StarredPage() {
   const navigate = useNavigate();
   const [repos, setRepos] = useState<GitHubRepo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
-  const [page, setPage] = useState(1);
+  const [refreshing, setRefreshing] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<SortKey>('updated');
   const [unstarring, setUnstarring] = useState<number | null>(null);
 
-  const CACHE_KEY = 'starred:p1';
+  const CACHE_KEY = 'starred:all';
 
-  const loadStarred = useCallback(async (p = 1, append = false, force = false) => {
-    if (p === 1) setLoading(true);
-    else setLoadingMore(true);
-
-    // 第一页且非追加时走缓存（强制刷新跳过）
-    if (p === 1 && !append && !force) {
-      const cached = pageCache.get<{ repos: GitHubRepo[]; hasMore: boolean }>(CACHE_KEY);
-      if (cached) {
-        setRepos(cached.repos);
-        setHasMore(cached.hasMore);
-        setPage(1);
+  // 排序在本地做，必须拿到全量收藏；首页先回填，剩余页并发补齐。
+  const loadStarred = useCallback(async (force = false) => {
+    if (!force) {
+      const cached = pageCache.get<GitHubRepo[]>(CACHE_KEY);
+      if (cached && cached.length > 0) {
+        setRepos(cached);
         setLoading(false);
         return;
       }
     }
-
+    if (force) setRefreshing(true);
+    else setLoading(true);
     try {
-      const data = await getStarredRepos({ per_page: 30, page: p });
-      if (append) setRepos((prev) => [...prev, ...data]);
-      else {
-        setRepos(data);
-        pageCache.set(CACHE_KEY, { repos: data, hasMore: data.length === 30 });
-      }
-      setHasMore(data.length === 30);
-      setPage(p);
+      const data = await getAllStarredRepos('created', 'desc', (firstPage) => {
+        setRepos(firstPage);
+        setLoading(false);
+      });
+      setRepos(data);
+      pageCache.set(CACHE_KEY, data);
     } catch {
       toast.error(i18n.t('加载收藏列表失败'));
     } finally {
       setLoading(false);
-      setLoadingMore(false);
+      setRefreshing(false);
     }
   }, []);
 
-  useEffect(() => { loadStarred(1); }, [loadStarred]);
+  useEffect(() => { loadStarred(); }, [loadStarred]);
+
+  // 切换排序或关键词后回到首屏条数，避免沿用上一次的展开量
+  useEffect(() => { setVisibleCount(PAGE_SIZE); }, [sort, search]);
 
   const handleUnstar = async (repo: GitHubRepo) => {
     const [owner, name] = repo.full_name.split('/');
@@ -106,7 +116,7 @@ export default function StarredPage() {
       await unstarRepo(owner, name);
       setRepos((prev) => {
         const updated = prev.filter((r) => r.id !== repo.id);
-        pageCache.set(CACHE_KEY, { repos: updated, hasMore: hasMore });
+        pageCache.set(CACHE_KEY, updated);
         return updated;
       });
       toast.success(`已取消收藏 ${repo.full_name}`);
@@ -129,6 +139,8 @@ export default function StarredPage() {
     }),
     sort
   );
+  const visible = filtered.slice(0, visibleCount);
+  const hasMore = filtered.length > visibleCount;
 
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-4xl mx-auto">
@@ -145,24 +157,24 @@ export default function StarredPage() {
           <Star className="w-5 h-5 text-primary fill-primary/30" />
           {i18n.t('我的收藏')}{!loading && (
             <Badge variant="outline" className="text-xs border-border text-muted-foreground font-normal">
-              {repos.length}{hasMore ? '+' : ''} {i18n.t('个')}</Badge>
+              {repos.length} {i18n.t('个')}</Badge>
           )}
         </h1>
         <Button
           variant="ghost"
           size="sm"
           className="border border-border text-muted-foreground hover:bg-secondary h-8"
-          onClick={() => loadStarred(1, false, true)}
-          disabled={loading}
+          onClick={() => loadStarred(true)}
+          disabled={loading || refreshing}
         >
-          <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading || refreshing ? 'animate-spin' : ''}`} />
           {i18n.t('刷新')}</Button>
       </div>
 
       {/* 搜索 + 排序 */}
       <div className="flex gap-2 flex-wrap">
         <div className="relative flex-1 min-w-[180px]">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -213,92 +225,90 @@ export default function StarredPage() {
           </div>
         ) : (
           <div className="divide-y divide-border">
-            {filtered.map((repo) => {
-              const [repoOwner] = repo.full_name.split('/');
-              return (
-                <div
-                  key={repo.id}
-                  className="p-4 hover:bg-secondary/30 transition-colors group"
-                >
-                  <div className="flex items-start gap-3">
-                    {/* 仓库信息 */}
-                    <button
-                      type="button"
-                      className="flex-1 min-w-0 text-left"
-                      onClick={() => navigate(`/repos/${repo.full_name}`)}
-                    >
-                      <div className="flex items-center gap-2 flex-wrap">
-                        {repo.private
-                          ? <Lock className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                          : <Globe className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                        }
-                        <span className="text-sm font-semibold text-accent group-hover:underline truncate">
-                          {repo.name}
-                        </span>
-                        {repo.fork && (
-                          <Badge variant="outline" className="text-xs border-border text-muted-foreground h-4 px-1">Fork</Badge>
-                        )}
-                      </div>
-
-                      {repo.description && (
-                        <p className="text-xs text-muted-foreground mt-1 line-clamp-2 text-pretty">
-                          {repo.description}
-                        </p>
-                      )}
-
-                      <div className="flex items-center gap-3 mt-2 flex-wrap">
-                        {repo.language && (
-                          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                            <span
-                              className="w-2.5 h-2.5 rounded-full shrink-0"
-                              style={{ backgroundColor: getLanguageColor(repo.language) }}
-                            />
-                            {repo.language}
-                          </span>
-                        )}
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                          <Star className="w-3 h-3" />
-                          {formatNumber(repo.stargazers_count)}
-                        </span>
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                          <GitFork className="w-3 h-3" />
-                          {formatNumber(repo.forks_count)}
-                        </span>
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                          <Clock className="w-3 h-3" />
-                          {formatRelativeTime(repo.updated_at)}
-                        </span>
-                        {repo.topics && repo.topics.length > 0 && (
-                          <div className="flex items-center gap-1 flex-wrap">
-                            {repo.topics.slice(0, 3).map((topic) => (
-                              <span
-                                key={topic}
-                                className="text-xs bg-accent/10 text-accent border border-accent/20 px-1.5 py-0.5 rounded"
-                              >
-                                {topic}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </button>
-
-                    {/* 取消收藏按钮 */}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="shrink-0 h-8 text-xs text-warning border border-warning/40 hover:bg-warning/10 hover:text-warning"
-                      disabled={unstarring === repo.id}
-                      onClick={() => handleUnstar(repo)}
-                      title={i18n.t('取消收藏')}
-                    >
-                      <Star className="w-3.5 h-3.5 mr-1 fill-warning" />
-                      {unstarring === repo.id ? i18n.t('处理中…') : i18n.t('已收藏')}
-                    </Button>
+            {visible.map((repo) => (
+              <div
+                key={repo.id}
+                role="button"
+                tabIndex={0}
+                className="px-4 py-3 hover:bg-secondary/30 transition-colors group cursor-pointer"
+                onClick={() => navigate(`/repos/${repo.full_name}`)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    navigate(`/repos/${repo.full_name}`);
+                  }
+                }}
+              >
+                {/* 第一行：仓库名 + 取消收藏（右固定，尺寸随行） */}
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                    {repo.private
+                      ? <Lock className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                      : <Globe className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                    }
+                    <span className="text-sm font-semibold text-accent group-hover:underline truncate">
+                      {repo.name}
+                    </span>
+                    {repo.fork && (
+                      <Badge variant="outline" className="text-[10px] border-border text-muted-foreground h-4 px-1 shrink-0">Fork</Badge>
+                    )}
                   </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="shrink-0 h-7 px-2 text-[11px] text-warning border border-warning/40 hover:bg-warning/10 hover:text-warning gap-1"
+                    disabled={unstarring === repo.id}
+                    onClick={(event) => { event.stopPropagation(); void handleUnstar(repo); }}
+                    title={i18n.t('取消收藏')}
+                  >
+                    <Star className="w-3 h-3 fill-warning" />
+                    {unstarring === repo.id ? i18n.t('处理中…') : i18n.t('已收藏')}
+                  </Button>
                 </div>
-              );
-            })}
+
+                {repo.description && (
+                  <p className="text-xs text-muted-foreground mt-1 line-clamp-2 text-pretty">
+                    {repo.description}
+                  </p>
+                )}
+
+                <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                  {repo.language && (
+                    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <span
+                        className="w-2.5 h-2.5 rounded-full shrink-0"
+                        style={{ backgroundColor: getLanguageColor(repo.language) }}
+                      />
+                      {repo.language}
+                    </span>
+                  )}
+                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <Star className="w-3 h-3" />
+                    {formatNumber(repo.stargazers_count)}
+                  </span>
+                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <GitFork className="w-3 h-3" />
+                    {formatNumber(repo.forks_count)}
+                  </span>
+                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <Clock className="w-3 h-3" />
+                    {formatRelativeTime(repo.pushed_at || repo.updated_at)}
+                  </span>
+                  {repo.topics && repo.topics.length > 0 && (
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {repo.topics.slice(0, 3).map((topic) => (
+                        <span
+                          key={topic}
+                          className="text-xs bg-accent/10 text-accent border border-accent/20 px-1.5 py-0.5 rounded"
+                        >
+                          {topic}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -308,10 +318,9 @@ export default function StarredPage() {
         <Button
           variant="ghost"
           className="w-full border border-border text-muted-foreground hover:bg-secondary"
-          disabled={loadingMore}
-          onClick={() => loadStarred(page + 1, true)}
+          onClick={() => setVisibleCount((count) => count + PAGE_SIZE)}
         >
-          {loadingMore ? <><RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />{i18n.t('加载中…')}</> : i18n.t('加载更多')}
+          {i18n.t('加载更多')}
         </Button>
       )}
     </div>

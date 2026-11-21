@@ -112,10 +112,12 @@ import {
   deleteFolderContents,
 } from '@/services/github';
 import { useAuth } from '@/contexts/AuthContext';
+import { isRepoOwner } from '@/lib/repoPermissions';
 import type { GitHubContent, GitHubBranch } from '@/types/types';
 import { toast } from 'sonner';
 import { decodeBase64Content, copyToClipboard } from '@/lib/utils';
 import { getFileIconInfo, isImageFile } from '@/components/common/FileIcon';
+import { fileToBase64, formatFileSize, base64ToDataUri, FileItemIcon, codeNavKey, getCodeNavStack, setCodeNavStack, EDITOR_QUICK_SYMBOLS, QuickToolButton, QuickSymbolButton } from '@/components/code/codeBrowserUtils';
 import { downloadGithubFile, downloadRepoDirectoryZip } from '@/lib/githubDownload';
 import { clearEditorDraft, readEditorDraft, saveEditorDraft, type EditorDraft } from '@/lib/editorDraft';
 import i18n from "@/i18n";
@@ -165,151 +167,13 @@ export interface EditorSyntaxError {
  * readAsArrayBuffer 始终读取文件的原始字节，不做任何编码解释，可保证上传内容与源文件完全一致。
  * 分块处理（8 KB/块）防止 String.fromCharCode spread 在大文件时触发 stack overflow。
  */
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const bytes = new Uint8Array(reader.result as ArrayBuffer);
-      const CHUNK = 8192;
-      let binary = '';
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-      }
-      resolve(btoa(binary));
-    };
-    reader.onerror = () => reject(new Error(i18n.t('读取文件失败')));
-    reader.readAsArrayBuffer(file);
-  });
-}
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-}
-
-// 将 base64 文件内容转为 data URI 用于图片预览
-function base64ToDataUri(base64: string, filename: string): string {
-  const ext = filename.split('.').pop()?.toLowerCase() || '';
-  const mimeMap: Record<string, string> = {
-    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-    gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-    bmp: 'image/bmp', ico: 'image/x-icon',
-  };
-  const mime = mimeMap[ext] || 'image/png';
-  return `data:${mime};base64,${base64}`;
-}
-
-// 文件图标组件
-function FileItemIcon({ filename, isDir, isOpen = false, size = 'w-4 h-4' }: {
-  filename: string;
-  isDir: boolean;
-  isOpen?: boolean;
-  size?: string;
-}) {
-  const { Icon, color } = getFileIconInfo(filename, isDir, isOpen);
-  return <Icon className={`${size} ${color} shrink-0`} />;
-}
-
-// ── 代码浏览页面内导航栈（sessionStorage，标签页级）────────────────────────
-// 用于在点击面包屑时回溯 browser history，而非推入新条目（避免"返回"跳到错误位置）
-function codeNavKey(owner: string, repo: string) {
-  return `code_nav_${owner}_${repo}`;
-}
-function getCodeNavStack(owner: string, repo: string): string[] {
-  try { return JSON.parse(sessionStorage.getItem(codeNavKey(owner, repo)) || '[]'); }
-  catch { return []; }
-}
-function setCodeNavStack(owner: string, repo: string, stack: string[]) {
-  try { sessionStorage.setItem(codeNavKey(owner, repo), JSON.stringify(stack)); }
-  catch { /* ignore */ }
-}
-
-// ── 移动端底部快捷栏 ─────────────────────────────────────────────────────
-// 参考 Acode：常用操作 + 代码符号横向滚动，尽量让拇指完成编辑。
-const EDITOR_QUICK_SYMBOLS: Array<{ label: string; value: string }> = [
-  { label: 'Tab', value: '  ' },
-  { label: '{', value: '{' },
-  { label: '}', value: '}' },
-  { label: '(', value: '(' },
-  { label: ')', value: ')' },
-  { label: '[', value: '[' },
-  { label: ']', value: ']' },
-  { label: '<', value: '<' },
-  { label: '>', value: '>' },
-  { label: ';', value: ';' },
-  { label: ':', value: ':' },
-  { label: '=', value: '=' },
-  { label: '+', value: '+' },
-  { label: '-', value: '-' },
-  { label: '*', value: '*' },
-  { label: '/', value: '/' },
-  { label: '\\', value: '\\' },
-  { label: "'", value: "'" },
-  { label: '"', value: '"' },
-  { label: '#', value: '#' },
-  { label: '!', value: '!' },
-  { label: '_', value: '_' },
-  { label: '?', value: '?' },
-  { label: '.', value: '.' },
-  { label: ',', value: ',' },
-  { label: '@', value: '@' },
-  { label: '&', value: '&' },
-  { label: '|', value: '|' },
-  { label: '$', value: '$' },
-  { label: '%', value: '%' },
-];
-
-function QuickToolButton({
-  title,
-  onClick,
-  active = false,
-  disabled = false,
-  children,
-}: {
-  title: string;
-  onClick: () => void;
-  active?: boolean;
-  disabled?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
-      className={`h-8 w-8 shrink-0 rounded-md hover:bg-white/10 hover:text-white ${active ? 'bg-white/10 text-white' : 'text-gray-300'} ${disabled ? 'opacity-40' : ''}`}
-      onPointerDown={(e) => e.preventDefault()}
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      aria-label={title}
-    >
-      {children}
-    </Button>
-  );
-}
-
-function QuickSymbolButton({ label, value, onInsert }: { label: string; value: string; onInsert: (value: string) => void }) {
-  return (
-    <button
-      type="button"
-      className="h-7 min-w-7 shrink-0 rounded-md px-1.5 font-mono text-[13px] text-gray-300 hover:bg-white/10 hover:text-white active:bg-white/20"
-      onPointerDown={(e) => e.preventDefault()}
-      onClick={() => onInsert(value)}
-      aria-label={`${i18n.t('插入')} ${label}`}
-    >
-      {label}
-    </button>
-  );
-}
-
 export default function CodeBrowserPage() {
   const { owner, repo, '*': filePath = '' } = useParams<{ owner: string; repo: string; '*': string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const branchParam = searchParams.get('branch') || '';
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+  const canManage = isRepoOwner(owner, user?.login);
   const [contents, setContents] = useState<GitHubContent[]>([]);
   const [fileContent, setFileContent] = useState<string | null>(null);
   const [fileBase64, setFileBase64] = useState<string | null>(null); // 原始 base64（用于图片）
@@ -506,8 +370,10 @@ export default function CodeBrowserPage() {
                 toast.warning(i18n.t('草稿基于旧版本，保存时会检查远端冲突'));
               }
             }
-            setActionMode('edit');
-            setEditorFullscreen(window.innerWidth < 768);
+            if (canManage) {
+              setActionMode('edit');
+              setEditorFullscreen(window.innerWidth < 768);
+            }
           }
         } else {
           setFileContent(i18n.t('（无法解码文件内容）'));
@@ -519,7 +385,7 @@ export default function CodeBrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [owner, repo, filePath, currentBranch]);
+  }, [owner, repo, filePath, currentBranch, canManage]);
 
   const handleDownloadDirectory = useCallback(async (directory?: string) => {
     if (!owner || !repo || !currentBranch || dirDownloading) return;
@@ -959,7 +825,7 @@ export default function CodeBrowserPage() {
         onClick={() => guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`)}>
         <FileItemIcon filename={item.name} isDir={false} size="w-3.5 h-3.5 mr-2" />
         {i18n.t('查看文件')}</ContextMenuItem>
-      {!isImageFile(item.name) && (
+      {canManage && !isImageFile(item.name) && (
         <ContextMenuItem className="text-foreground cursor-pointer text-sm"
           onClick={() => guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`)}>
           <Pencil className="w-3.5 h-3.5 mr-2" />{i18n.t('编辑文件')}</ContextMenuItem>
@@ -1008,26 +874,34 @@ export default function CodeBrowserPage() {
         onClick={() => void handleDownloadDirectory(item.path)}>
         <Download className="w-3.5 h-3.5 mr-2" />{i18n.t('下载文件夹 ZIP')}</ContextMenuItem>
       <ContextMenuSeparator className="bg-border" />
-      <ContextMenuItem className="text-foreground cursor-pointer text-sm"
-        onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('new-file'), 100); }}>
-        <FilePlus className="w-3.5 h-3.5 mr-2" />{i18n.t('新建文件')}</ContextMenuItem>
-      <ContextMenuItem className="text-foreground cursor-pointer text-sm"
-        onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('new-folder'), 100); }}>
-        <FolderPlus className="w-3.5 h-3.5 mr-2" />{i18n.t('新建子文件夹')}</ContextMenuItem>
-      <ContextMenuItem className="text-foreground cursor-pointer text-sm"
-        onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('upload'), 100); }}>
-        <Upload className="w-3.5 h-3.5 mr-2" />{i18n.t('上传文件')}</ContextMenuItem>
-      <ContextMenuSeparator className="bg-border" />
+      {canManage && (
+        <>
+          <ContextMenuItem className="text-foreground cursor-pointer text-sm"
+            onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('new-file'), 100); }}>
+            <FilePlus className="w-3.5 h-3.5 mr-2" />{i18n.t('新建文件')}</ContextMenuItem>
+          <ContextMenuItem className="text-foreground cursor-pointer text-sm"
+            onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('new-folder'), 100); }}>
+            <FolderPlus className="w-3.5 h-3.5 mr-2" />{i18n.t('新建子文件夹')}</ContextMenuItem>
+          <ContextMenuItem className="text-foreground cursor-pointer text-sm"
+            onClick={() => { guardedNavigate(`/repos/${owner}/${repo}/code/${item.path}`); setTimeout(() => openAction('upload'), 100); }}>
+            <Upload className="w-3.5 h-3.5 mr-2" />{i18n.t('上传文件')}</ContextMenuItem>
+          <ContextMenuSeparator className="bg-border" />
+        </>
+      )}
       <ContextMenuItem className="text-foreground cursor-pointer text-sm"
         onClick={() => handleCopyPath(item.path)}>
         <ClipboardCopy className="w-3.5 h-3.5 mr-2" />{i18n.t('复制路径')}</ContextMenuItem>
-      <ContextMenuItem className="text-foreground cursor-pointer text-sm"
-        onClick={() => openAction('rename', item)}>
-        <Pencil className="w-3.5 h-3.5 mr-2" />{i18n.t('重命名')}</ContextMenuItem>
-      <ContextMenuSeparator className="bg-border" />
-      <ContextMenuItem className="text-destructive cursor-pointer text-sm focus:text-destructive"
-        onClick={() => { setCommitMsg(`Delete folder ${item.name}`); openAction('delete-folder', item); }}>
-        <Trash2 className="w-3.5 h-3.5 mr-2" />{i18n.t('删除文件夹')}</ContextMenuItem>
+      {canManage && (
+        <>
+          <ContextMenuItem className="text-foreground cursor-pointer text-sm"
+            onClick={() => openAction('rename', item)}>
+            <Pencil className="w-3.5 h-3.5 mr-2" />{i18n.t('重命名')}</ContextMenuItem>
+          <ContextMenuSeparator className="bg-border" />
+          <ContextMenuItem className="text-destructive cursor-pointer text-sm focus:text-destructive"
+            onClick={() => { setCommitMsg(`Delete folder ${item.name}`); openAction('delete-folder', item); }}>
+            <Trash2 className="w-3.5 h-3.5 mr-2" />{i18n.t('删除文件夹')}</ContextMenuItem>
+        </>
+      )}
     </ContextMenuContent>
   );
 
@@ -1169,6 +1043,7 @@ export default function CodeBrowserPage() {
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 <FileTree
+              canEdit={canManage}
               owner={owner!}
               repo={repo!}
               branch={currentBranch}
@@ -1206,6 +1081,7 @@ export default function CodeBrowserPage() {
             </SheetHeader>
             <div className="flex-1 min-h-0 overflow-hidden">
               <FileTree
+                canEdit={canManage}
                 owner={owner!}
                 repo={repo!}
                 branch={currentBranch}
@@ -1644,11 +1520,11 @@ export default function CodeBrowserPage() {
               <span className="text-xs text-muted-foreground px-1 font-mono">/</span>
             )}
             {/* 目录操作按钮（仅目录页显示） */}
-            {!currentFile && !loading && (
+            {canManage && !currentFile && !loading && (
               <div className="flex items-center gap-0.5 shrink-0">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2"
+                    <Button variant="ghost" size="sm" className={`h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2 `}
                       disabled={dirDownloading}
                       title={dirDownloading && dirProgress ? `${dirProgress.done}/${dirProgress.total}` : i18n.t('下载')}>
                       {dirDownloading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
@@ -1668,15 +1544,15 @@ export default function CodeBrowserPage() {
                   </DropdownMenuContent>
                 </DropdownMenu>
                 <span className="w-px h-4 bg-border mx-0.5 shrink-0" />
-                <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2"
+                <Button variant="ghost" size="sm" className={`h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2 `}
                   onClick={() => openAction('new-file')}>
                   <FilePlus className="w-3 h-3" /><span className="hidden sm:inline">{i18n.t('新建文件')}</span>
                 </Button>
-                <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2"
+                <Button variant="ghost" size="sm" className={`h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2 `}
                   onClick={() => openAction('new-folder')}>
                   <FolderPlus className="w-3 h-3" /><span className="hidden sm:inline">{i18n.t('新建文件夹')}</span>
                 </Button>
-                <Button variant="ghost" size="sm" className="h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2"
+                <Button variant="ghost" size="sm" className={`h-7 text-xs text-muted-foreground border border-border hover:bg-secondary gap-1 px-2 `}
                   onClick={() => openAction('upload')}>
                   <Upload className="w-3 h-3" /><span className="hidden sm:inline">{i18n.t('上传')}</span>
                 </Button>
@@ -1725,16 +1601,20 @@ export default function CodeBrowserPage() {
                   <DropdownMenuContent align="end" className="w-44">
                     <DropdownMenuItem onClick={() => { const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${currentBranch}/${currentFile.path}`; copyToClipboard(rawUrl); toast.success(i18n.t('Raw 链接已复制')); }}>
                       <Link className="w-3.5 h-3.5 mr-2" />{i18n.t('复制 Raw 链接')}</DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onClick={() => openAction('rename', currentFile)}>
-                      <Pencil className="w-3.5 h-3.5 mr-2" />{i18n.t('重命名')}</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => openAction('move', currentFile)}>
-                      <MoveRight className="w-3.5 h-3.5 mr-2" />{i18n.t('移动到...')}</DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      className="text-destructive focus:text-destructive"
-                      onClick={() => { setCommitMsg(`Delete ${currentFile.name}`); openAction('delete-file', currentFile); }}>
-                      <Trash2 className="w-3.5 h-3.5 mr-2" />{i18n.t('删除文件')}</DropdownMenuItem>
+                    {canManage && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onClick={() => openAction('rename', currentFile)}>
+                          <Pencil className="w-3.5 h-3.5 mr-2" />{i18n.t('重命名')}</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => openAction('move', currentFile)}>
+                          <MoveRight className="w-3.5 h-3.5 mr-2" />{i18n.t('移动到...')}</DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={() => { setCommitMsg(`Delete ${currentFile.name}`); openAction('delete-file', currentFile); }}>
+                          <Trash2 className="w-3.5 h-3.5 mr-2" />{i18n.t('删除文件')}</DropdownMenuItem>
+                      </>
+                    )}
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
@@ -1833,6 +1713,10 @@ export default function CodeBrowserPage() {
                   </p>
                 </div>
               </div>
+            ) : !canManage && fileContent !== null ? (
+              <div className="p-4 overflow-auto">
+                <pre className="text-xs font-mono whitespace-pre text-foreground/90">{fileContent}</pre>
+              </div>
             ) : (
               /* 文本文件 - 移动端等待全屏编辑器打开时的占位 */
               <div className="flex md:hidden flex-col items-center justify-center py-16 gap-4">
@@ -1855,9 +1739,11 @@ export default function CodeBrowserPage() {
               <div className="py-12 text-center">
                 <FolderOpen className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
                 <p className="text-muted-foreground text-sm">{i18n.t('空目录')}</p>
-                <Button variant="ghost" size="sm" className="mt-3 h-8 text-xs text-muted-foreground border border-border hover:bg-secondary"
-                  onClick={() => openAction('new-file')}>
-                  <Plus className="w-3.5 h-3.5 mr-1.5" />{i18n.t('创建第一个文件')}</Button>
+                {canManage && (
+                  <Button variant="ghost" size="sm" className="mt-3 h-8 text-xs text-muted-foreground border border-border hover:bg-secondary"
+                    onClick={() => openAction('new-file')}>
+                    <Plus className="w-3.5 h-3.5 mr-1.5" />{i18n.t('创建第一个文件')}</Button>
+                )}
               </div>
             ) : (
               contents.map((item) => {
@@ -2156,7 +2042,7 @@ export default function CodeBrowserPage() {
               onDragLeave={() => setIsDragging(false)}
               onDrop={(e) => { e.preventDefault(); setIsDragging(false); addUploadFiles(e.dataTransfer.files); }}
               className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-colors ${
-                isDragging ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50'
+                isDragging ? 'border-primary bg-primary/5' : 'border-border hover:bg-secondary/30'
               }`}
               onClick={() => uploadInputRef.current?.click()}
             >

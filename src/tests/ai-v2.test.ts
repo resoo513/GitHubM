@@ -368,6 +368,35 @@ describe('AI Assistant V2 provider', () => {
     )).rejects.toThrow('请求超时');
   });
 
+  it('resets the timeout whenever a stream chunk arrives', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      const encoder = new TextEncoder();
+      let sent = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const timer = setInterval(() => {
+            if (sent < 4) {
+              controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'));
+              sent += 1;
+              return;
+            }
+            clearInterval(timer);
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          }, 100);
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }));
+    const result = await streamProvider(
+      { ...config, timeoutMs: 300 },
+      [{ role: 'user', content: 'hi' }],
+      [],
+      new AbortController().signal,
+      () => undefined,
+    );
+    expect(result.content).toBe('xxxx');
+  });
   it('uses the official OpenRouter endpoint and passes tools', () => {
     const request = buildProviderRequest(config, [{ role: 'user', content: 'hi' }], [{
       type: 'function',
@@ -379,6 +408,23 @@ describe('AI Assistant V2 provider', () => {
     expect(request.body.model).toBe('test-model');
   });
 
+  it('defaults to the official endpoint without sending the key through a proxy', () => {
+    const request = buildProviderRequest({
+      type: 'deepseek',
+      api_key: 'sk-test',
+      model: 'deepseek-chat',
+    }, [{ role: 'user', content: 'hi' }], []);
+    expect(request.url).toBe('https://api.deepseek.com/v1/chat/completions');
+    expect(request.headers['x-llm-provider']).toBeUndefined();
+    expect(request.headers['x-llm-upstream']).toBeUndefined();
+  });
+  it('requires an explicit proxy for the Cloudflare free channel', () => {
+    expect(() => buildProviderRequest({
+      type: 'cloudflare',
+      api_key: 'cloudflare-free',
+      model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+    }, [{ role: 'user', content: 'hi' }], [])).toThrow('Cloudflare 免费通道需要先填写代理地址');
+  });
   it('builds the Cloudflare AI fallback request without a user key', () => {
     const request = buildProviderRequest({
       type: 'cloudflare',
