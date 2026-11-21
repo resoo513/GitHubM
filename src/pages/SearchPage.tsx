@@ -21,6 +21,7 @@ import {
   MessageSquare,
   Smile,
   CalendarDays,
+  ChevronDown,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -102,7 +103,8 @@ type CodeSearchItem = {
 
 interface SortConfig {
   value: SortOption;
-  label: string;
+  /** i18n key；显示文案在渲染时实时取，切换语言后立即生效 */
+  labelKey: string;
   apiSort?: string;
   apiOrder?: 'asc' | 'desc';
   /** 该排序项所属的搜索类型 */
@@ -114,7 +116,7 @@ const BEST_MATCH_TYPES: SearchType[] = ['repositories', 'issues', 'users', 'code
 /** 最佳匹配是所有搜索类型共有的首选项 */
 const BEST_MATCH_OPTION: SortConfig = {
   value: 'best-match',
-  label: i18n.t('最佳匹配'),
+  labelKey: '最佳匹配',
   types: BEST_MATCH_TYPES,
 };
 
@@ -122,27 +124,27 @@ const BEST_MATCH_OPTION: SortConfig = {
 const SORT_OPTIONS_BY_TYPE: Record<SearchType, SortConfig[]> = {
   repositories: [
     BEST_MATCH_OPTION,
-    { value: 'stars',       label: i18n.t('Stars 最多'),       apiSort: 'stars',              apiOrder: 'desc', types: ['repositories'] },
-    { value: 'forks',       label: i18n.t('Forks 最多'),       apiSort: 'forks',              apiOrder: 'desc', types: ['repositories'] },
-    { value: 'updated',     label: i18n.t('最近更新'),         apiSort: 'updated',            apiOrder: 'desc', types: ['repositories'] },
-    { value: 'help-wanted', label: i18n.t('Help Wanted 最多'), apiSort: 'help-wanted-issues', apiOrder: 'desc', types: ['repositories'] },
+    { value: 'stars',       labelKey: 'Stars 最多',       apiSort: 'stars',              apiOrder: 'desc', types: ['repositories'] },
+    { value: 'forks',       labelKey: 'Forks 最多',       apiSort: 'forks',              apiOrder: 'desc', types: ['repositories'] },
+    { value: 'updated',     labelKey: '最近更新',         apiSort: 'updated',            apiOrder: 'desc', types: ['repositories'] },
+    { value: 'help-wanted', labelKey: 'Help Wanted 最多', apiSort: 'help-wanted-issues', apiOrder: 'desc', types: ['repositories'] },
   ],
   issues: [
     BEST_MATCH_OPTION,
-    { value: 'comments',  label: i18n.t('评论最多'), apiSort: 'comments',  apiOrder: 'desc', types: ['issues'] },
-    { value: 'newest',    label: i18n.t('最新创建'), apiSort: 'created',   apiOrder: 'desc', types: ['issues'] },
-    { value: 'updated',   label: i18n.t('最近更新'), apiSort: 'updated',   apiOrder: 'desc', types: ['issues'] },
-    { value: 'reactions', label: i18n.t('反应最多'), apiSort: 'reactions', apiOrder: 'desc', types: ['issues'] },
+    { value: 'comments',  labelKey: '评论最多', apiSort: 'comments',  apiOrder: 'desc', types: ['issues'] },
+    { value: 'newest',    labelKey: '最新创建', apiSort: 'created',   apiOrder: 'desc', types: ['issues'] },
+    { value: 'updated',   labelKey: '最近更新', apiSort: 'updated',  apiOrder: 'desc', types: ['issues'] },
+    { value: 'reactions', labelKey: '反应最多', apiSort: 'reactions', apiOrder: 'desc', types: ['issues'] },
   ],
   users: [
     BEST_MATCH_OPTION,
-    { value: 'followers',    label: i18n.t('关注者最多'), apiSort: 'followers',    apiOrder: 'desc', types: ['users'] },
-    { value: 'repositories', label: i18n.t('仓库最多'),   apiSort: 'repositories', apiOrder: 'desc', types: ['users'] },
-    { value: 'joined',       label: i18n.t('最近加入'),   apiSort: 'joined',       apiOrder: 'desc', types: ['users'] },
+    { value: 'followers',    labelKey: '关注者最多', apiSort: 'followers',    apiOrder: 'desc', types: ['users'] },
+    { value: 'repositories', labelKey: '仓库最多',   apiSort: 'repositories', apiOrder: 'desc', types: ['users'] },
+    { value: 'joined',       labelKey: '最近加入',   apiSort: 'joined',       apiOrder: 'desc', types: ['users'] },
   ],
   code: [
     BEST_MATCH_OPTION,
-    { value: 'indexed', label: i18n.t('最近索引'), apiSort: 'indexed', apiOrder: 'desc', types: ['code'] },
+    { value: 'indexed', labelKey: '最近索引', apiSort: 'indexed', apiOrder: 'desc', types: ['code'] },
   ],
 };
 
@@ -159,6 +161,10 @@ const ALL_SORT_OPTIONS: SortConfig[] = (() => {
 
 const findSortOption = (value: SortOption | null | undefined): SortConfig | undefined =>
   value ? ALL_SORT_OPTIONS.find(o => o.value === value) : undefined;
+
+/** 渲染时实时取排序文案：切换语言后立即生效（不依赖模块加载时的快照） */
+const sortLabel = (cfg: SortConfig | undefined): string =>
+  cfg ? i18n.t(cfg.labelKey) : '';
 
 /** 取某搜索类型下可用的排序项 */
 const sortOptionsFor = (type: SearchType): SortConfig[] => SORT_OPTIONS_BY_TYPE[type];
@@ -597,10 +603,18 @@ export default function SearchPage() {
     return pages;
   };
 
-  /** 排序入口：固定在搜索框内部左侧，只显示当前排序图标 */
-  const renderSortMenu = () => {
+  /**
+   * 排序入口
+   * - leading：搜索框内部左侧图标（上游样式，不占用额外空间）
+   * - toolbar：结果区上方的可见排序条，带当前排序名文字（对齐 GitHub 官网结果头部的排序下拉）
+   *
+   * 为什么要两个入口：框内图标只有一个 32px 灰图标，在手机上完全看不出是排序，
+   * 导致功能实际不可被发现（#140 合并后 #147 改成纯图标、#202 移除摘要行连带删掉文字入口）。
+   */
+  const renderSortMenu = (variant: 'leading' | 'toolbar') => {
     const { icon: SortIcon } = SORT_ICONS[sortOption];
-    const currentLabel = findSortOption(sortOption)?.label ?? '';
+    const currentLabel = sortLabel(findSortOption(sortOption));
+    const leading = variant === 'leading';
     return (
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -608,12 +622,24 @@ export default function SearchPage() {
             type="button"
             title={`${i18n.t('排序方式')}：${currentLabel}`}
             aria-label={`${i18n.t('排序方式')}：${currentLabel}`}
-            className="absolute left-1 top-1/2 z-10 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            className={cn(
+              'flex items-center gap-1.5 rounded-md transition-colors',
+              leading
+                ? 'absolute left-1 top-1/2 z-10 h-8 w-8 -translate-y-1/2 justify-center text-muted-foreground hover:bg-secondary hover:text-foreground'
+                : 'h-7 shrink-0 px-2 text-xs text-muted-foreground hover:bg-secondary hover:text-foreground'
+            )}
           >
-            <SortIcon className="h-4 w-4" />
+            <SortIcon className="h-4 w-4 shrink-0" />
+            {!leading && (
+              <>
+                <span className="whitespace-nowrap">{i18n.t('排序')}</span>
+                <span className="whitespace-nowrap text-foreground">{currentLabel}</span>
+                <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />
+              </>
+            )}
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="w-48 bg-popover border-border">
+        <DropdownMenuContent align={leading ? 'start' : 'end'} className="w-48 bg-popover border-border">
           {sortOptions.map(opt => {
             const { icon: OptIcon } = SORT_ICONS[opt.value];
             return (
@@ -626,7 +652,7 @@ export default function SearchPage() {
                 onClick={() => handleSortChange(opt.value)}
               >
                 <OptIcon className="w-3.5 h-3.5 shrink-0" />
-                {opt.label}
+                {sortLabel(opt)}
                 {sortOption === opt.value && (
                   <span className="ml-auto text-primary text-xs">✓</span>
                 )}
@@ -643,7 +669,7 @@ export default function SearchPage() {
       <div className="flex items-center gap-2">
         <div className="relative flex-1 min-w-0">
           {sortOptions.length > 1
-            ? renderSortMenu()
+            ? renderSortMenu('leading')
             : <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />}
           <Input
             ref={inputRef}
@@ -737,8 +763,14 @@ export default function SearchPage() {
         ))}
       </div>
 
-      {/* 结果摘要行已移除：关键词/总数/页码/排序对移动端属冗余噪音，会挤占首屏第一条结果；
-          当前排序仍可从搜索框左侧排序按钮的 title / aria-label 获知 */}
+      {/* 排序入口（结果区，可见文字）
+          上游 #147 把排序改成搜索框内的纯图标、#202 移除摘要行时连带删掉了结果区的文字入口，
+          导致手机上排序实际不可发现。这里恢复一个带文字的可见入口，位置与 GitHub 官网结果头部一致。 */}
+      {sortOptions.length > 1 && (
+        <div className="flex items-center justify-end -mt-1">
+          {renderSortMenu('toolbar')}
+        </div>
+      )}
 
       {/* 搜索结果 */}
       {loading ? (
