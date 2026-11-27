@@ -5,6 +5,7 @@ import { GITHUB_EDIT_TOOLS } from './tools/githubEdit';
 import { GITHUB_OPS_TOOLS } from './tools/githubOps';
 import { ARTIFACT_TOOLS } from './tools/artifacts';
 import { MEMORY_TOOLS } from './tools/memory';
+import { DISCOVER_TOOLS } from './tools/discover';
 
 export interface CapabilityPack extends CapabilityInfo {
   tools: AgentTool[];
@@ -17,6 +18,14 @@ export const CAPABILITY_PACKS: CapabilityPack[] = [
     label: '核心',
     description: 'Artifact 读取与长期记忆能力',
     tools: [...ARTIFACT_TOOLS, ...MEMORY_TOOLS],
+    active: () => true,
+  },
+  {
+    id: 'discover',
+    label: '项目发现',
+    description: '全站搜索仓库并评估是否适合需求（不依赖当前仓库）',
+    tools: DISCOVER_TOOLS,
+    // 关键：找项目场景用户往往没打开任何仓库，所以不能像其它包那样要求 ctx.repo
     active: () => true,
   },
   {
