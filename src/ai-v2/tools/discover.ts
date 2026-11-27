@@ -84,21 +84,18 @@ function relaxQueries(query: string): string[] {
 }
 
 function formatRepoBrief(repo: Record<string, any>, index: number): string {
-  const lines: string[] = [];
+  // 只给模型最少但足够的字段：名字、热度、语言、活跃度、一句话定位
+  // fork 数/issue 数/topics 这类字段会诱使模型堆际数据、把回答写成散文，故不提供
   const archived = repo.archived ? ' · ⚠️已归档' : '';
-  lines.push(
-    `${index}. ${repo.full_name}  ★${repo.stargazers_count} · Fork ${repo.forks_count} · ` +
-    `${repo.language || '语言未知'} · ${repo.open_issues_count} 个开放 issue${archived}`
-  );
-  lines.push(`   最近推送：${String(repo.pushed_at || '').slice(0, 10)}`);
-  if (repo.description) {
-    lines.push(`   ${String(repo.description).replace(/\s+/g, ' ').slice(0, 180)}`);
-  }
-  if (Array.isArray(repo.topics) && repo.topics.length) {
-    lines.push(`   主题：${repo.topics.slice(0, 6).join(', ')}`);
-  }
-  lines.push(`   ${repo.html_url}`);
-  return lines.join('\n');
+  const license = repo.license?.spdx_id && repo.license.spdx_id !== 'NOASSERTION'
+    ? ` · ${repo.license.spdx_id}` : '';
+  const head =
+    `${index}. ${repo.full_name}  ★${repo.stargazers_count} · ${repo.language || '语言未知'}` +
+    ` · 推送 ${String(repo.pushed_at || '').slice(0, 10)}${license}${archived}`;
+  const desc = repo.description
+    ? `   ${String(repo.description).replace(/\s+/g, ' ').slice(0, 110)}`
+    : '   （无描述）';
+  return `${head}\n${desc}\n   ${repo.html_url}`;
 }
 
 const searchProjects: AgentTool = {
