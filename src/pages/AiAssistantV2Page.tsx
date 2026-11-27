@@ -2343,6 +2343,7 @@ export default function AiAssistantV2Page({ visible = true, compactKeyboard = fa
         { label: i18n.t('解释项目结构'), text: '请用 github_list_files 查看当前仓库目录结构，并解释主要目录的职责。' },
       ]
     : [
+        { label: i18n.t('帮我找项目'), text: '我想找个项目，但还没想清楚具体要什么，你先问我两三个关键问题，再帮我搜。' },
         { label: i18n.t('解释代码'), text: '请解释这段代码的作用，并指出潜在问题：\n```\n\n```' },
         { label: i18n.t('写一个工具函数'), text: '请用 TypeScript 写一个通用工具函数：安全地解析 JSON，失败时返回默认值。' },
         { label: i18n.t('制定计划'), text: '帮我把一个模糊目标拆成可执行的小步骤，并指出第一步。' },
