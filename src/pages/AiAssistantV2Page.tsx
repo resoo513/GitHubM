@@ -2663,6 +2663,18 @@ export default function AiAssistantV2Page({ visible = true, compactKeyboard = fa
                   ))}
                 </div>
               )}
+              {/* 常驻入口：找项目。不看是否已有对话、也不看是否挂了仓库上下文，始终可见 */}
+              <div className="mb-1.5 flex flex-wrap gap-1 px-1">
+                <button
+                  type="button"
+                  onClick={() => setInput('我想找个项目，但还没想清楚具体要什么，你先问我两三个关键问题，再帮我搜。')}
+                  className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                  title={i18n.t('描述你想做什么，AI 会先追问关键点再帮你搜项目')}
+                >
+                  <Sparkles className="h-3 w-3 shrink-0" />
+                  {i18n.t('帮我找项目')}
+                </button>
+              </div>
               <Textarea
                 value={input}
                 onChange={event => {
